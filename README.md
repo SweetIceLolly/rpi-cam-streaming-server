@@ -6,4 +6,4 @@ WebSockets based python FPV server, ideal for use with Raspberry Pi.
 ```
 python3 server.py
 ```
-test.html will run automatically when opened.
+demo.html will run automatically when opened.
