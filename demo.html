@@ -10,17 +10,18 @@
             return document.getElementById(id)
         }
 
-        document.onload = function(){
+        window.onload = function(){
             // Connect to our server:
-            test = new WebSocket("ws://localhost:8000/");
+            let test = new WebSocket("ws://128.189.92.96:8000/");
 
             // This will run when data comes through the WebSocket:
             test.onmessage = async function (event) {
                 // Get image:
 		            var image = await event.data.text();
-                // Preload image:
+                // Preload image:d
                 $("stream").src = image;
             }
+        }
     </script>
     <style>
         body {

@@ -21,13 +21,13 @@ import cv2
 import asyncio
 import websockets
 import base64
+from picamera2 import Picamera2
 
 
-async def handle_connection(websocket, path):
+async def handle_connection(websocket):
     """
     Websocket connection handler
-    :param websocket: Conected websocket
-    :param path: Path of connected websocket
+    :param websocket: Connected websocket
     :return: None
     """
     for frame in get_frames():
@@ -36,25 +36,28 @@ async def handle_connection(websocket, path):
 
 def get_frames():
     """
-    Generator function that uses cv2 to stream frames to a websocket,
+    Generator function that uses picamera2 to stream frames to a websocket,
     yielding byte-encoded frames.
     :return: None
     """
     while True:
-        success, frame = camera.read()  # read the camera frame
-        if not success:
-            break
-        else:
-            _, buffer = cv2.imencode('.png', frame)
-            frame = base64.b64encode(buffer)
-            yield b'data:image/png;base64,' + frame
+        frame = camera.capture_array()
+        _, buffer = cv2.imencode('.png', frame)
+        frame = base64.b64encode(buffer)
+        yield b'data:image/png;base64,' + frame
 
 
-# Start video capture
-camera = cv2.VideoCapture(0)
-# Start the server
-start_server = websockets.serve(handle_connection, "localhost", 8000)
+# Start video capture with Raspberry Pi camera
+camera = Picamera2()
+camera.configure(camera.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)}))
+camera.start()
 
-# Do async stuff
-asyncio.get_event_loop().run_until_complete(start_server)
-asyncio.get_event_loop().run_forever()
+
+async def main():
+    """Start the WebSocket server."""
+    async with websockets.serve(handle_connection, "0.0.0.0", 8000):
+        await asyncio.Future()  # Run forever
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
