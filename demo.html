@@ -12,14 +12,20 @@
 
         window.onload = function(){
             // Connect to our server:
-            let test = new WebSocket("ws://128.189.92.96:8000/");
+            let ws = new WebSocket("ws://128.189.92.96:8000/");
+            ws.binaryType = "blob";
+
+            let currentUrl = null;
 
             // This will run when data comes through the WebSocket:
-            test.onmessage = async function (event) {
-                // Get image:
-		            var image = await event.data.text();
-                // Preload image:d
-                $("stream").src = image;
+            ws.onmessage = function (event) {
+                // Revoke previous URL to prevent memory leaks
+                if (currentUrl) {
+                    URL.revokeObjectURL(currentUrl);
+                }
+                // Create blob URL directly from binary data
+                currentUrl = URL.createObjectURL(event.data);
+                $("stream").src = currentUrl;
             }
         }
     </script>

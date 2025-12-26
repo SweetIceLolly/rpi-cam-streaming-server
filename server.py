@@ -16,11 +16,9 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
-import time
 import cv2
 import asyncio
 import websockets
-import base64
 from picamera2 import Picamera2
 
 
@@ -34,17 +32,21 @@ async def handle_connection(websocket):
         await websocket.send(frame)
 
 
+# JPEG encoding parameters for performance
+JPEG_QUALITY = 70  # Adjust 1-100: lower = smaller/faster, higher = better quality
+
+
 def get_frames():
     """
     Generator function that uses picamera2 to stream frames to a websocket,
     yielding byte-encoded frames.
     :return: None
     """
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
     while True:
         frame = camera.capture_array()
-        _, buffer = cv2.imencode('.png', frame)
-        frame = base64.b64encode(buffer)
-        yield b'data:image/png;base64,' + frame
+        _, buffer = cv2.imencode('.jpg', frame, encode_params)
+        yield bytes(buffer)
 
 
 # Start video capture with Raspberry Pi camera
