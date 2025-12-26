@@ -13,6 +13,10 @@
         let ws = null;
         let currentUrl = null;
         let encryptionKey = null;
+        let bytesReceived = 0;
+        let lastBytesReceived = 0;
+        let lastSpeedUpdate = Date.now();
+        let speedUpdateInterval = null;
 
         async function deriveKey(password) {
             const encoder = new TextEncoder();
@@ -69,11 +73,34 @@
             ws.binaryType = "blob";
 
             ws.onopen = function() {
-                status.textContent = "Connected";
+                status.textContent = "Connected - 0 KB/s";
+                bytesReceived = 0;
+                lastBytesReceived = 0;
+                lastSpeedUpdate = Date.now();
+                // Update speed display every second
+                speedUpdateInterval = setInterval(() => {
+                    const now = Date.now();
+                    const elapsed = (now - lastSpeedUpdate) / 1000;
+                    const bytesDiff = bytesReceived - lastBytesReceived;
+                    const speed = bytesDiff / elapsed;
+                    let speedText;
+                    if (speed >= 1024 * 1024) {
+                        speedText = (speed / (1024 * 1024)).toFixed(2) + " MB/s";
+                    } else {
+                        speedText = (speed / 1024).toFixed(2) + " KB/s";
+                    }
+                    status.textContent = "Connected - " + speedText;
+                    lastBytesReceived = bytesReceived;
+                    lastSpeedUpdate = now;
+                }, 1000);
             };
 
             ws.onclose = function() {
                 status.textContent = "Disconnected";
+                if (speedUpdateInterval) {
+                    clearInterval(speedUpdateInterval);
+                    speedUpdateInterval = null;
+                }
             };
 
             ws.onerror = function() {
@@ -83,6 +110,7 @@
             // This will run when data comes through the WebSocket:
             ws.onmessage = async function (event) {
                 const encryptedData = await event.data.arrayBuffer();
+                bytesReceived += encryptedData.byteLength;
                 const decryptedData = await decryptData(encryptedData);
                 
                 if (decryptedData) {
