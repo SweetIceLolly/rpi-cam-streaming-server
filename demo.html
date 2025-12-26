@@ -10,12 +10,34 @@
             return document.getElementById(id)
         }
 
-        window.onload = function(){
+        let ws = null;
+        let currentUrl = null;
+
+        function connect() {
+            const address = $("serverIp").value;
+            const status = $("status");
+
+            if (ws) {
+                ws.close();
+            }
+
+            status.textContent = "Connecting...";
+
             // Connect to our server:
-            let ws = new WebSocket("ws://128.189.92.96:8000/");
+            ws = new WebSocket(address);
             ws.binaryType = "blob";
 
-            let currentUrl = null;
+            ws.onopen = function() {
+                status.textContent = "Connected";
+            };
+
+            ws.onclose = function() {
+                status.textContent = "Disconnected";
+            };
+
+            ws.onerror = function() {
+                status.textContent = "Error";
+            };
 
             // This will run when data comes through the WebSocket:
             ws.onmessage = function (event) {
@@ -36,6 +58,11 @@
     </style>
 </head>
 <body>
+    <div style="margin-bottom: 10px;">
+        <input type="text" id="serverIp" value="ws://128.189.92.96:8000/" style="width: 300px;">
+        <button onclick="connect()">Connect</button>
+        <span id="status">Disconnected</span>
+    </div>
     <img src="" id="stream" class="bgimg">
 </body>
 </html>
