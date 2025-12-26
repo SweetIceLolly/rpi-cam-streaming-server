@@ -50,6 +50,25 @@
                 $("stream").src = currentUrl;
             }
         }
+
+        function updateSettings() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert("Not connected");
+                return;
+            }
+            
+            const width = parseInt($("width").value);
+            const height = parseInt($("height").value);
+            const quality = parseInt($("quality").value);
+            
+            const payload = {
+                width: width,
+                height: height,
+                quality: quality
+            };
+            
+            ws.send(JSON.stringify(payload));
+        }
     </script>
     <style>
         body {
@@ -62,6 +81,12 @@
         <input type="text" id="serverIp" value="ws://128.189.92.96:8000/" style="width: 300px;">
         <button onclick="connect()">Connect</button>
         <span id="status">Disconnected</span>
+    </div>
+    <div style="margin-bottom: 10px;">
+        <label>Width: <input type="number" id="width" value="640"></label>
+        <label>Height: <input type="number" id="height" value="480"></label>
+        <label>Quality: <input type="number" id="quality" value="70"></label>
+        <button onclick="updateSettings()">Update Settings</button>
     </div>
     <img src="" id="stream" class="bgimg">
 </body>
