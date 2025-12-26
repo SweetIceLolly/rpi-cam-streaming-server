@@ -173,6 +173,10 @@
                             displayViewers(response.viewers);
                             return;
                         }
+                        if (response.access_log) {
+                            displayAccessLog(response.access_log);
+                            return;
+                        }
                     } catch (e) {
                         // Not JSON, continue
                     }
@@ -239,6 +243,32 @@
             }
         }
 
+        function getAccessLog() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert("Not connected");
+                return;
+            }
+            ws.send(JSON.stringify({ get_access_log: true }));
+        }
+
+        function displayAccessLog(log) {
+            const accessLogDiv = $("accessLog");
+            if (log.length === 0) {
+                accessLogDiv.innerHTML = "<em>No access log entries</em>";
+            } else {
+                let html = "<strong>Access Log (" + log.length + " entries):</strong><ul>";
+                // Show most recent first
+                for (let i = log.length - 1; i >= 0; i--) {
+                    const entry = log[i];
+                    const status = entry.success ? '<span style="color: green;">SUCCESS</span>' : '<span style="color: red;">FAILED</span>';
+                    const errorMsg = entry.error ? " - " + entry.error : "";
+                    html += "<li>" + entry.timestamp + " | " + entry.remote_address + " | " + status + errorMsg + "</li>";
+                }
+                html += "</ul>";
+                accessLogDiv.innerHTML = html;
+            }
+        }
+
         // Load settings when page loads
         window.addEventListener('DOMContentLoaded', loadSettings);
     </script>
@@ -262,8 +292,10 @@
         <label>Quality: <input type="number" id="quality" value="70"></label>
         <button onclick="updateSettings()">Update Settings</button>
         <button onclick="getViewers()">Get Active Viewers</button>
+        <button onclick="getAccessLog()">Get Access Log</button>
     </div>
     <div id="viewersList" style="margin-bottom: 10px;"></div>
+    <div id="accessLog" style="margin-bottom: 10px;"></div>
     <img src="" id="stream" class="bgimg">
 </body>
 </html>

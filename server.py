@@ -57,6 +57,10 @@ camera.start()
 active_connections = {}  # websocket -> connection_info dict
 connection_id_counter = 0
 
+# Access log for authentication attempts
+access_log = []  # List of {timestamp, remote_address, success, error}
+MAX_ACCESS_LOG_ENTRIES = 100  # Keep last 100 entries
+
 
 async def send_frames(websocket):
     global JPEG_QUALITY
@@ -101,6 +105,9 @@ async def receive_commands(websocket):
                         'remote_address': info['remote_address']
                     })
                 await websocket.send(json.dumps({'viewers': viewers}))
+            if data.get('get_access_log'):
+                # Send access log
+                await websocket.send(json.dumps({'access_log': access_log}))
         except Exception as e:
             print(f"Error processing command: {e}")
 
@@ -111,19 +118,38 @@ async def authenticate(websocket):
     :param websocket: Connected websocket
     :return: True if authenticated, False otherwise
     """
+    remote_address = str(websocket.remote_address) if websocket.remote_address else 'unknown'
+    
+    def log_attempt(success, error=None):
+        """Log an authentication attempt."""
+        entry = {
+            'timestamp': datetime.now().isoformat(),
+            'remote_address': remote_address,
+            'success': success,
+            'error': error
+        }
+        access_log.append(entry)
+        # Keep only the last MAX_ACCESS_LOG_ENTRIES entries
+        while len(access_log) > MAX_ACCESS_LOG_ENTRIES:
+            access_log.pop(0)
+    
     try:
         message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
         data = json.loads(message)
         if data.get('access_password') == ACCESS_PASSWORD:
+            log_attempt(True)
             await websocket.send(json.dumps({'authenticated': True}))
             return True
         else:
+            log_attempt(False, 'Invalid access password')
             await websocket.send(json.dumps({'authenticated': False, 'error': 'Invalid access password'}))
             return False
     except asyncio.TimeoutError:
+        log_attempt(False, 'Authentication timeout')
         await websocket.send(json.dumps({'authenticated': False, 'error': 'Authentication timeout'}))
         return False
     except Exception as e:
+        log_attempt(False, str(e))
         print(f"Authentication error: {e}")
         return False
 
