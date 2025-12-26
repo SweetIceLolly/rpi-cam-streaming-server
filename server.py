@@ -36,6 +36,7 @@ def load_password():
     """Load password from file or environment variable."""
     password_file = 'STREAM_PASSWORD'
     if password_file and os.path.exists(password_file):
+        print("Loading STREAM_PASSWORD from file.")
         with open(password_file, 'r') as f:
             return f.read().strip()
     print("STREAM_PASSWORD file not found, using default password.")
