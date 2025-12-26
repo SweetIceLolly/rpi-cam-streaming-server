@@ -12,10 +12,51 @@
 
         let ws = null;
         let currentUrl = null;
+        let encryptionKey = null;
 
-        function connect() {
+        async function deriveKey(password) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(password);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+            return await crypto.subtle.importKey(
+                'raw',
+                hashBuffer,
+                { name: 'AES-GCM' },
+                false,
+                ['decrypt']
+            );
+        }
+
+        async function decryptData(encryptedBuffer) {
+            const data = new Uint8Array(encryptedBuffer);
+            const nonce = data.slice(0, 12);
+            const ciphertext = data.slice(12);
+            
+            try {
+                const decrypted = await crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: nonce },
+                    encryptionKey,
+                    ciphertext
+                );
+                return decrypted;
+            } catch (e) {
+                console.error('Decryption failed:', e);
+                return null;
+            }
+        }
+
+        async function connect() {
             const address = $("serverIp").value;
+            const password = $("password").value;
             const status = $("status");
+
+            if (!password) {
+                alert("Please enter the decryption password");
+                return;
+            }
+
+            // Derive encryption key from password
+            encryptionKey = await deriveKey(password);
 
             if (ws) {
                 ws.close();
@@ -40,14 +81,20 @@
             };
 
             // This will run when data comes through the WebSocket:
-            ws.onmessage = function (event) {
-                // Revoke previous URL to prevent memory leaks
-                if (currentUrl) {
-                    URL.revokeObjectURL(currentUrl);
+            ws.onmessage = async function (event) {
+                const encryptedData = await event.data.arrayBuffer();
+                const decryptedData = await decryptData(encryptedData);
+                
+                if (decryptedData) {
+                    // Revoke previous URL to prevent memory leaks
+                    if (currentUrl) {
+                        URL.revokeObjectURL(currentUrl);
+                    }
+                    // Create blob URL from decrypted data
+                    const blob = new Blob([decryptedData], { type: 'image/jpeg' });
+                    currentUrl = URL.createObjectURL(blob);
+                    $("stream").src = currentUrl;
                 }
-                // Create blob URL directly from binary data
-                currentUrl = URL.createObjectURL(event.data);
-                $("stream").src = currentUrl;
             }
         }
 
@@ -79,6 +126,7 @@
 <body>
     <div style="margin-bottom: 10px;">
         <input type="text" id="serverIp" value="ws://128.189.92.96:8000/" style="width: 300px;">
+        <input type="password" id="password" placeholder="Decryption Password" style="width: 150px;">
         <button onclick="connect()">Connect</button>
         <span id="status">Disconnected</span>
     </div>

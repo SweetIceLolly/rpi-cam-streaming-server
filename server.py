@@ -20,6 +20,9 @@ import cv2
 import asyncio
 import websockets
 import json
+import os
+import hashlib
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from picamera2 import Picamera2
 
 
@@ -27,6 +30,12 @@ from picamera2 import Picamera2
 JPEG_QUALITY = 70
 WIDTH = 640
 HEIGHT = 480
+
+# Encryption settings
+ENCRYPTION_PASSWORD = os.environ.get("STREAM_PASSWORD", "changeme")
+# Derive a 256-bit key from the password using SHA-256
+ENCRYPTION_KEY = hashlib.sha256(ENCRYPTION_PASSWORD.encode()).digest()
+AESGCM_CIPHER = AESGCM(ENCRYPTION_KEY)
 
 # Start video capture with Raspberry Pi camera
 camera = Picamera2()
@@ -41,7 +50,11 @@ async def send_frames(websocket):
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
         _, buffer = cv2.imencode('.jpg', frame, encode_params)
         try:
-            await websocket.send(bytes(buffer))
+            # Encrypt the frame data
+            nonce = os.urandom(12)  # 96-bit nonce for AES-GCM
+            encrypted_data = AESGCM_CIPHER.encrypt(nonce, bytes(buffer), None)
+            # Send nonce + encrypted data
+            await websocket.send(nonce + encrypted_data)
             await asyncio.sleep(0.001)
         except websockets.ConnectionClosed:
             break
