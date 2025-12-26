@@ -18,6 +18,33 @@
         let lastSpeedUpdate = Date.now();
         let speedUpdateInterval = null;
 
+        const STORAGE_KEY = 'fpv-stream-settings';
+
+        function saveSettings() {
+            const settings = {
+                serverUrl: $("serverIp").value,
+                width: $("width").value,
+                height: $("height").value,
+                quality: $("quality").value
+            };
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+        }
+
+        function loadSettings() {
+            const saved = localStorage.getItem(STORAGE_KEY);
+            if (saved) {
+                try {
+                    const settings = JSON.parse(saved);
+                    if (settings.serverUrl) $("serverIp").value = settings.serverUrl;
+                    if (settings.width) $("width").value = settings.width;
+                    if (settings.height) $("height").value = settings.height;
+                    if (settings.quality) $("quality").value = settings.quality;
+                } catch (e) {
+                    console.error('Failed to load settings:', e);
+                }
+            }
+        }
+
         async function deriveKey(password) {
             const encoder = new TextEncoder();
             const data = encoder.encode(password);
@@ -58,6 +85,9 @@
                 alert("Please enter the decryption password");
                 return;
             }
+
+            // Save settings when connecting
+            saveSettings();
 
             // Derive encryption key from password
             encryptionKey = await deriveKey(password);
@@ -143,7 +173,13 @@
             };
             
             ws.send(JSON.stringify(payload));
+            
+            // Save settings when updating
+            saveSettings();
         }
+
+        // Load settings when page loads
+        window.addEventListener('DOMContentLoaded', loadSettings);
     </script>
     <style>
         body {
