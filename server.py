@@ -22,6 +22,7 @@ import websockets
 import json
 import os
 import hashlib
+from datetime import datetime
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from picamera2 import Picamera2
 
@@ -51,6 +52,10 @@ AESGCM_CIPHER = AESGCM(ENCRYPTION_KEY)
 camera = Picamera2()
 camera.configure(camera.create_preview_configuration(main={"format": "RGB888", "size": (WIDTH, HEIGHT)}))
 camera.start()
+
+# Active connections tracking
+active_connections = {}  # websocket -> connection_info dict
+connection_id_counter = 0
 
 
 async def send_frames(websocket):
@@ -86,6 +91,16 @@ async def receive_commands(websocket):
                     camera.stop()
                     camera.configure(camera.create_preview_configuration(main={"format": "RGB888", "size": (WIDTH, HEIGHT)}))
                     camera.start()
+            if data.get('get_viewers'):
+                # Send list of active viewers
+                viewers = []
+                for ws, info in active_connections.items():
+                    viewers.append({
+                        'id': info['id'],
+                        'connected_at': info['connected_at'],
+                        'remote_address': info['remote_address']
+                    })
+                await websocket.send(json.dumps({'viewers': viewers}))
         except Exception as e:
             print(f"Error processing command: {e}")
 
@@ -119,18 +134,36 @@ async def handle_connection(websocket):
     :param websocket: Connected websocket
     :return: None
     """
+    global connection_id_counter
+    
     # Wait for authentication before sending frames
     if not await authenticate(websocket):
         return
     
-    sender = asyncio.create_task(send_frames(websocket))
-    receiver = asyncio.create_task(receive_commands(websocket))
-    done, pending = await asyncio.wait(
-        [sender, receiver],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    for task in pending:
-        task.cancel()
+    # Register this connection
+    connection_id_counter += 1
+    connection_info = {
+        'id': connection_id_counter,
+        'connected_at': datetime.now().isoformat(),
+        'remote_address': str(websocket.remote_address) if websocket.remote_address else 'unknown'
+    }
+    active_connections[websocket] = connection_info
+    print(f"Client {connection_info['id']} connected from {connection_info['remote_address']}")
+    
+    try:
+        sender = asyncio.create_task(send_frames(websocket))
+        receiver = asyncio.create_task(receive_commands(websocket))
+        done, pending = await asyncio.wait(
+            [sender, receiver],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+    finally:
+        # Unregister this connection
+        if websocket in active_connections:
+            print(f"Client {active_connections[websocket]['id']} disconnected")
+            del active_connections[websocket]
 
 
 async def main():

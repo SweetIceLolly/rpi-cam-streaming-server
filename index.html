@@ -165,6 +165,19 @@
                     return;
                 }
 
+                // Check if this is a viewers list response (JSON text)
+                if (typeof event.data === 'string') {
+                    try {
+                        const response = JSON.parse(event.data);
+                        if (response.viewers) {
+                            displayViewers(response.viewers);
+                            return;
+                        }
+                    } catch (e) {
+                        // Not JSON, continue
+                    }
+                }
+
                 const encryptedData = await event.data.arrayBuffer();
                 bytesReceived += encryptedData.byteLength;
                 const decryptedData = await decryptData(encryptedData);
@@ -204,6 +217,28 @@
             saveSettings();
         }
 
+        function getViewers() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert("Not connected");
+                return;
+            }
+            ws.send(JSON.stringify({ get_viewers: true }));
+        }
+
+        function displayViewers(viewers) {
+            const viewersList = $("viewersList");
+            if (viewers.length === 0) {
+                viewersList.innerHTML = "<em>No active viewers</em>";
+            } else {
+                let html = "<strong>Active Viewers (" + viewers.length + "):</strong><ul>";
+                viewers.forEach(v => {
+                    html += "<li>ID: " + v.id + " | Connected: " + v.connected_at + " | Address: " + v.remote_address + "</li>";
+                });
+                html += "</ul>";
+                viewersList.innerHTML = html;
+            }
+        }
+
         // Load settings when page loads
         window.addEventListener('DOMContentLoaded', loadSettings);
     </script>
@@ -226,7 +261,9 @@
         <label>Height: <input type="number" id="height" value="480"></label>
         <label>Quality: <input type="number" id="quality" value="70"></label>
         <button onclick="updateSettings()">Update Settings</button>
+        <button onclick="getViewers()">Get Active Viewers</button>
     </div>
+    <div id="viewersList" style="margin-bottom: 10px;"></div>
     <img src="" id="stream" class="bgimg">
 </body>
 </html>
