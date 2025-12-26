@@ -108,7 +108,7 @@ async def handle_connection(websocket):
 
 async def main():
     """Start the WebSocket server."""
-    async with websockets.serve(handle_connection, "0.0.0.0", 8000):
+    async with websockets.serve(handle_connection, "localhost", 8000):
         await asyncio.Future()  # Run forever
 
 
