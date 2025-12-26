@@ -38,6 +38,7 @@ def load_password():
     if password_file and os.path.exists(password_file):
         with open(password_file, 'r') as f:
             return f.read().strip()
+    print("STREAM_PASSWORD file not found, using default password.")
     return os.environ.get("STREAM_PASSWORD", "changeme")
 
 ENCRYPTION_PASSWORD = load_password()
