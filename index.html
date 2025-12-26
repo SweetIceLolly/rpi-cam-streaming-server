@@ -25,7 +25,9 @@
                 serverUrl: $("serverIp").value,
                 width: $("width").value,
                 height: $("height").value,
-                quality: $("quality").value
+                quality: $("quality").value,
+                password: $("password").value,
+                accessPassword: $("accessPassword").value
             };
             localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
         }
@@ -39,6 +41,8 @@
                     if (settings.width) $("width").value = settings.width;
                     if (settings.height) $("height").value = settings.height;
                     if (settings.quality) $("quality").value = settings.quality;
+                    if (settings.password) $("password").value = settings.password;
+                    if (settings.accessPassword) $("accessPassword").value = settings.accessPassword;
                 } catch (e) {
                     console.error('Failed to load settings:', e);
                 }
