@@ -103,26 +103,10 @@
             ws.binaryType = "blob";
 
             ws.onopen = function() {
-                status.textContent = "Connected - 0 KB/s";
-                bytesReceived = 0;
-                lastBytesReceived = 0;
-                lastSpeedUpdate = Date.now();
-                // Update speed display every second
-                speedUpdateInterval = setInterval(() => {
-                    const now = Date.now();
-                    const elapsed = (now - lastSpeedUpdate) / 1000;
-                    const bytesDiff = bytesReceived - lastBytesReceived;
-                    const speed = bytesDiff / elapsed;
-                    let speedText;
-                    if (speed >= 1024 * 1024) {
-                        speedText = (speed / (1024 * 1024)).toFixed(2) + " MB/s";
-                    } else {
-                        speedText = (speed / 1024).toFixed(2) + " KB/s";
-                    }
-                    status.textContent = "Connected - " + speedText;
-                    lastBytesReceived = bytesReceived;
-                    lastSpeedUpdate = now;
-                }, 1000);
+                status.textContent = "Authenticating...";
+                // Send access password for authentication
+                const accessPassword = $("accessPassword").value;
+                ws.send(JSON.stringify({ access_password: accessPassword }));
             };
 
             ws.onclose = function() {
@@ -137,8 +121,50 @@
                 status.textContent = "Error";
             };
 
+            let authenticated = false;
+
             // This will run when data comes through the WebSocket:
             ws.onmessage = async function (event) {
+                // Check if this is an authentication response (JSON text)
+                if (!authenticated && typeof event.data === 'string') {
+                    try {
+                        const response = JSON.parse(event.data);
+                        if (response.authenticated === true) {
+                            authenticated = true;
+                            status.textContent = "Connected - 0 KB/s";
+                            bytesReceived = 0;
+                            lastBytesReceived = 0;
+                            lastSpeedUpdate = Date.now();
+                            // Update speed display every second
+                            speedUpdateInterval = setInterval(() => {
+                                const now = Date.now();
+                                const elapsed = (now - lastSpeedUpdate) / 1000;
+                                const bytesDiff = bytesReceived - lastBytesReceived;
+                                const speed = bytesDiff / elapsed;
+                                let speedText;
+                                if (speed >= 1024 * 1024) {
+                                    speedText = (speed / (1024 * 1024)).toFixed(2) + " MB/s";
+                                } else {
+                                    speedText = (speed / 1024).toFixed(2) + " KB/s";
+                                }
+                                status.textContent = "Connected - " + speedText;
+                                lastBytesReceived = bytesReceived;
+                                lastSpeedUpdate = now;
+                            }, 1000);
+                        } else {
+                            status.textContent = "Authentication failed: " + (response.error || "Unknown error");
+                            ws.close();
+                        }
+                        return;
+                    } catch (e) {
+                        // Not JSON, might be binary data
+                    }
+                }
+
+                if (!authenticated) {
+                    return;
+                }
+
                 const encryptedData = await event.data.arrayBuffer();
                 bytesReceived += encryptedData.byteLength;
                 const decryptedData = await decryptData(encryptedData);
@@ -191,6 +217,7 @@
     <div style="margin-bottom: 10px;">
         <input type="text" id="serverIp" value="wss://128.189.92.96:8000/" style="width: 300px;">
         <input type="password" id="password" placeholder="Decryption Password" style="width: 150px;">
+        <input type="password" id="accessPassword" placeholder="Access Password" style="width: 150px;">
         <button onclick="connect()">Connect</button>
         <span id="status">Disconnected</span>
     </div>

@@ -32,17 +32,17 @@ WIDTH = 640
 HEIGHT = 480
 
 # Encryption settings
-def load_password():
+def load_password(password_file, env_var, default_value):
     """Load password from file or environment variable."""
-    password_file = 'STREAM_PASSWORD'
     if password_file and os.path.exists(password_file):
-        print("Loading STREAM_PASSWORD from file.")
+        print(f"Loading {env_var} from file.")
         with open(password_file, 'r') as f:
             return f.read().strip()
-    print("STREAM_PASSWORD file not found, using default password.")
-    return os.environ.get("STREAM_PASSWORD", "changeme")
+    print(f"{password_file} file not found, using default password.")
+    return os.environ.get(env_var, default_value)
 
-ENCRYPTION_PASSWORD = load_password()
+ENCRYPTION_PASSWORD = load_password('STREAM_PASSWORD', 'STREAM_PASSWORD', 'changeme')
+ACCESS_PASSWORD = load_password('ACCESS_PASSWORD', 'ACCESS_PASSWORD', 'accessme')
 # Derive a 256-bit key from the password using SHA-256
 ENCRYPTION_KEY = hashlib.sha256(ENCRYPTION_PASSWORD.encode()).digest()
 AESGCM_CIPHER = AESGCM(ENCRYPTION_KEY)
@@ -90,12 +90,39 @@ async def receive_commands(websocket):
             print(f"Error processing command: {e}")
 
 
+async def authenticate(websocket):
+    """
+    Wait for the client to send the correct access password.
+    :param websocket: Connected websocket
+    :return: True if authenticated, False otherwise
+    """
+    try:
+        message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
+        data = json.loads(message)
+        if data.get('access_password') == ACCESS_PASSWORD:
+            await websocket.send(json.dumps({'authenticated': True}))
+            return True
+        else:
+            await websocket.send(json.dumps({'authenticated': False, 'error': 'Invalid access password'}))
+            return False
+    except asyncio.TimeoutError:
+        await websocket.send(json.dumps({'authenticated': False, 'error': 'Authentication timeout'}))
+        return False
+    except Exception as e:
+        print(f"Authentication error: {e}")
+        return False
+
+
 async def handle_connection(websocket):
     """
     Websocket connection handler
     :param websocket: Connected websocket
     :return: None
     """
+    # Wait for authentication before sending frames
+    if not await authenticate(websocket):
+        return
+    
     sender = asyncio.create_task(send_frames(websocket))
     receiver = asyncio.create_task(receive_commands(websocket))
     done, pending = await asyncio.wait(
