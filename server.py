@@ -32,7 +32,15 @@ WIDTH = 640
 HEIGHT = 480
 
 # Encryption settings
-ENCRYPTION_PASSWORD = os.environ.get("STREAM_PASSWORD", "changeme")
+def load_password():
+    """Load password from file or environment variable."""
+    password_file = 'STREAM_PASSWORD'
+    if password_file and os.path.exists(password_file):
+        with open(password_file, 'r') as f:
+            return f.read().strip()
+    return os.environ.get("STREAM_PASSWORD", "changeme")
+
+ENCRYPTION_PASSWORD = load_password()
 # Derive a 256-bit key from the password using SHA-256
 ENCRYPTION_KEY = hashlib.sha256(ENCRYPTION_PASSWORD.encode()).digest()
 AESGCM_CIPHER = AESGCM(ENCRYPTION_KEY)
