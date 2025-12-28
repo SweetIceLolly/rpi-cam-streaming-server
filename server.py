@@ -2,6 +2,7 @@
 server.py
 WebSocket FPV server
 Copyright (C) 2023  Aiden Bohlander
+Copyright (C) 2025  Hanson Liang
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
