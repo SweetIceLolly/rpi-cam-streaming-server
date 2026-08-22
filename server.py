@@ -17,13 +17,23 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
-import cv2
 import asyncio
-import websockets
+import base64
+import binascii
+import hashlib
+import hmac
 import json
 import os
-import hashlib
+import re
+import secrets
+import subprocess
+import time
 from datetime import datetime
+
+import cv2
+import websockets
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from picamera2 import Picamera2
 
@@ -33,25 +43,152 @@ JPEG_QUALITY = 70
 WIDTH = 640
 HEIGHT = 480
 
-# Encryption settings
+# Command protocol settings
+COMMAND_AAD = b"rpi-camera-command-v1"
+RESPONSE_AAD_PREFIX = b"rpi-camera-response-v1:"
+PASSWORD_KDF_ITERATIONS = 600_000
+MAX_COMMAND_CLOCK_SKEW_SECONDS = 30
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+RESOLUTION_PATTERN = re.compile(r"\b(\d{2,5})x(\d{2,5})\s+\[")
+
+
 def load_password(password_file, env_var, default_value):
-    """Load password from file or environment variable."""
+    """Load a password from a file, or fall back to an environment variable."""
     if password_file and os.path.exists(password_file):
         print(f"Loading {env_var} from file.")
-        with open(password_file, 'r') as f:
-            return f.read().strip()
-    print(f"{password_file} file not found, using default password.")
+        with open(password_file, "r", encoding="utf-8") as password_handle:
+            return password_handle.read().strip()
+    print(f"{password_file} file not found, using environment/default password.")
     return os.environ.get(env_var, default_value)
 
-ENCRYPTION_PASSWORD = load_password('STREAM_PASSWORD', 'STREAM_PASSWORD', 'changeme')
-ACCESS_PASSWORD = load_password('ACCESS_PASSWORD', 'ACCESS_PASSWORD', 'accessme')
-# Derive a 256-bit key from the password using SHA-256
-ENCRYPTION_KEY = hashlib.sha256(ENCRYPTION_PASSWORD.encode()).digest()
+
+def load_or_create_command_private_key(key_path):
+    """Load the command RSA key, creating a mode-0600 PKCS8 key if needed."""
+    try:
+        with open(key_path, "rb") as key_handle:
+            private_key = serialization.load_pem_private_key(
+                key_handle.read(), password=None
+            )
+        if not isinstance(private_key, rsa.RSAPrivateKey):
+            raise ValueError(f"Command key at {key_path} is not an RSA private key")
+        return private_key
+    except FileNotFoundError:
+        pass
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    private_key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    try:
+        file_descriptor = os.open(
+            key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+    except FileExistsError:
+        # Another server process created it while this process generated a key.
+        return load_or_create_command_private_key(key_path)
+
+    with os.fdopen(file_descriptor, "wb") as key_handle:
+        key_handle.write(private_key_pem)
+    print(f"Created command private key at {key_path}")
+    return private_key
+
+
+def discover_camera_resolutions():
+    """Return unique camera mode resolutions reported by rpicam-hello."""
+    try:
+        result = subprocess.run(
+            ["rpicam-hello", "--list-cameras"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=15,
+        )
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as error:
+        print(f"Unable to discover camera resolutions: {error}")
+        return []
+
+    resolutions = []
+    seen = set()
+    for width_text, height_text in RESOLUTION_PATTERN.findall(result.stdout):
+        resolution = (int(width_text), int(height_text))
+        if resolution not in seen:
+            seen.add(resolution)
+            resolutions.append(resolution)
+    return resolutions
+
+
+def encode_base64(data):
+    return base64.b64encode(data).decode("ascii")
+
+
+def decode_base64(value, field_name, max_decoded_length):
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be base64 text")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise ValueError(f"{field_name} is not valid base64") from error
+    if len(decoded) > max_decoded_length:
+        raise ValueError(f"{field_name} is too large")
+    return decoded
+
+
+# Video encryption settings
+encryption_password = load_password("STREAM_PASSWORD", "STREAM_PASSWORD", "changeme")
+access_password = load_password("ACCESS_PASSWORD", "ACCESS_PASSWORD", "accessme")
+ENCRYPTION_KEY = hashlib.sha256(encryption_password.encode("utf-8")).digest()
 AESGCM_CIPHER = AESGCM(ENCRYPTION_KEY)
+
+# The persistent key allows clients to pin the server identity between restarts.
+DEFAULT_COMMAND_KEY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "command_private_key.pem"
+)
+COMMAND_KEY_PATH = os.environ.get(
+    "COMMAND_PRIVATE_KEY_FILE", DEFAULT_COMMAND_KEY_PATH
+)
+COMMAND_PRIVATE_KEY = load_or_create_command_private_key(COMMAND_KEY_PATH)
+COMMAND_PUBLIC_KEY_DER = COMMAND_PRIVATE_KEY.public_key().public_bytes(
+    encoding=serialization.Encoding.DER,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+)
+COMMAND_PUBLIC_KEY_PEM = COMMAND_PRIVATE_KEY.public_key().public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+).decode("ascii")
+COMMAND_PUBLIC_KEY_FINGERPRINT = hashlib.sha256(COMMAND_PUBLIC_KEY_DER).hexdigest()
+print(f"Command public key fingerprint: {COMMAND_PUBLIC_KEY_FINGERPRINT}")
+
+# The public salt is tied to the persistent server key. Only the PBKDF2 verifier,
+# never the user's access password, is sent to the server.
+ACCESS_PASSWORD_SALT = hashlib.sha256(
+    COMMAND_PUBLIC_KEY_DER + b"rpi-camera-access-password-v1"
+).digest()[:16]
+ACCESS_PASSWORD_HASH = hashlib.pbkdf2_hmac(
+    "sha256",
+    access_password.encode("utf-8"),
+    ACCESS_PASSWORD_SALT,
+    PASSWORD_KDF_ITERATIONS,
+    dklen=32,
+)
+del encryption_password, access_password
+
+AVAILABLE_RESOLUTIONS = discover_camera_resolutions()
 
 # Start video capture with Raspberry Pi camera
 camera = Picamera2()
-camera.configure(camera.create_preview_configuration(main={"format": "RGB888", "size": (WIDTH, HEIGHT)}))
+camera.configure(
+    camera.create_preview_configuration(
+        main={"format": "RGB888", "size": (WIDTH, HEIGHT)}
+    )
+)
 camera.start()
 
 # Active connections tracking
@@ -60,7 +197,123 @@ connection_id_counter = 0
 
 # Access log for authentication attempts
 access_log = []  # List of {timestamp, remote_address, success, error}
-MAX_ACCESS_LOG_ENTRIES = 100  # Keep last 100 entries
+MAX_ACCESS_LOG_ENTRIES = 100
+
+
+def log_access_attempt(websocket, success, error=None):
+    remote_address = (
+        str(websocket.remote_address) if websocket.remote_address else "unknown"
+    )
+    access_log.append(
+        {
+            "timestamp": datetime.now().isoformat(),
+            "remote_address": remote_address,
+            "success": success,
+            "error": error,
+        }
+    )
+    while len(access_log) > MAX_ACCESS_LOG_ENTRIES:
+        access_log.pop(0)
+
+
+def decrypt_command_envelope(message):
+    """Hybrid-decrypt a command and return its payload, AES key, and request id."""
+    if not isinstance(message, str) or len(message) > 100_000:
+        raise ValueError("Encrypted command must be bounded JSON text")
+
+    envelope = json.loads(message)
+    if not isinstance(envelope, dict) or envelope.get("type") != "encrypted_command":
+        raise ValueError("Expected an encrypted command envelope")
+
+    encrypted_key = decode_base64(
+        envelope.get("encrypted_key"), "encrypted_key", 1024
+    )
+    nonce = decode_base64(envelope.get("nonce"), "nonce", 12)
+    ciphertext = decode_base64(envelope.get("ciphertext"), "ciphertext", 65_536)
+    if len(nonce) != 12:
+        raise ValueError("Command nonce must be 12 bytes")
+
+    aes_key = COMMAND_PRIVATE_KEY.decrypt(
+        encrypted_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=COMMAND_AAD,
+        ),
+    )
+    if len(aes_key) != 32:
+        raise ValueError("Command AES key must be 256 bits")
+
+    plaintext = AESGCM(aes_key).decrypt(nonce, ciphertext, COMMAND_AAD)
+    payload = json.loads(plaintext.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Command payload must be an object")
+
+    request_id = payload.get("request_id")
+    if not isinstance(request_id, str) or not REQUEST_ID_PATTERN.fullmatch(request_id):
+        raise ValueError("Invalid request id")
+    return payload, aes_key, request_id
+
+
+def validate_authenticated_command(payload, session):
+    """Validate password proof, connection binding, freshness, and replay nonce."""
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not hmac.compare_digest(
+        session_id, session["id"]
+    ):
+        raise ValueError("Command belongs to a different connection")
+
+    timestamp = payload.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+        raise ValueError("Invalid command timestamp")
+    now = int(time.time())
+    if abs(now - timestamp) > MAX_COMMAND_CLOCK_SKEW_SECONDS:
+        raise ValueError("Command timestamp is outside the allowed window")
+
+    request_nonce = payload.get("request_nonce")
+    if not isinstance(request_nonce, str) or not REQUEST_ID_PATTERN.fullmatch(
+        request_nonce
+    ):
+        raise ValueError("Invalid request nonce")
+
+    supplied_hash = decode_base64(
+        payload.get("access_password_hash"), "access_password_hash", 32
+    )
+    if len(supplied_hash) != 32 or not hmac.compare_digest(
+        supplied_hash, ACCESS_PASSWORD_HASH
+    ):
+        raise ValueError("Invalid access password")
+
+    # A timestamp bounds replays; retaining slightly more than that window catches
+    # duplicates without allowing this set to grow for the life of the connection.
+    expired_before = now - (MAX_COMMAND_CLOCK_SKEW_SECONDS * 2)
+    session["used_nonces"] = {
+        nonce: used_at
+        for nonce, used_at in session["used_nonces"].items()
+        if used_at >= expired_before
+    }
+    if request_nonce in session["used_nonces"]:
+        raise ValueError("Command nonce has already been used")
+    session["used_nonces"][request_nonce] = now
+
+
+async def send_encrypted_response(websocket, aes_key, request_id, payload):
+    """Encrypt a response with the one-time AES key from its request."""
+    nonce = os.urandom(12)
+    aad = RESPONSE_AAD_PREFIX + request_id.encode("ascii")
+    plaintext = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ciphertext = AESGCM(aes_key).encrypt(nonce, plaintext, aad)
+    await websocket.send(
+        json.dumps(
+            {
+                "type": "encrypted_response",
+                "request_id": request_id,
+                "nonce": encode_base64(nonce),
+                "ciphertext": encode_base64(ciphertext),
+            },
+            separators=(",", ":"),
+        )
+    )
 
 
 async def send_frames(websocket):
@@ -68,126 +321,198 @@ async def send_frames(websocket):
     while True:
         frame = camera.capture_array()
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-        _, buffer = cv2.imencode('.jpg', frame, encode_params)
+        _, buffer = cv2.imencode(".jpg", frame, encode_params)
         try:
-            # Encrypt the frame data
-            nonce = os.urandom(12)  # 96-bit nonce for AES-GCM
+            nonce = os.urandom(12)
             encrypted_data = AESGCM_CIPHER.encrypt(nonce, bytes(buffer), None)
-            # Send nonce + encrypted data
             await websocket.send(nonce + encrypted_data)
             await asyncio.sleep(0.001)
         except websockets.ConnectionClosed:
             break
 
 
-async def receive_commands(websocket):
+async def receive_commands(websocket, session):
     global JPEG_QUALITY, WIDTH, HEIGHT
     async for message in websocket:
+        aes_key = None
+        request_id = None
         try:
-            data = json.loads(message)
-            if 'quality' in data:
-                JPEG_QUALITY = int(data['quality'])
-            if 'width' in data and 'height' in data:
-                new_w = int(data['width'])
-                new_h = int(data['height'])
-                if new_w != WIDTH or new_h != HEIGHT:
-                    WIDTH = new_w
-                    HEIGHT = new_h
+            data, aes_key, request_id = decrypt_command_envelope(message)
+            validate_authenticated_command(data, session)
+            command = data.get("command")
+
+            if command == "update_settings":
+                new_quality = int(data["quality"])
+                new_width = int(data["width"])
+                new_height = int(data["height"])
+                if not 1 <= new_quality <= 100:
+                    raise ValueError("JPEG quality must be between 1 and 100")
+                if (
+                    not 1 <= new_width <= 16_384
+                    or not 1 <= new_height <= 16_384
+                ):
+                    raise ValueError("Resolution dimensions are outside the allowed range")
+
+                JPEG_QUALITY = new_quality
+                if new_width != WIDTH or new_height != HEIGHT:
+                    WIDTH = new_width
+                    HEIGHT = new_height
                     camera.stop()
-                    camera.configure(camera.create_preview_configuration(main={"format": "RGB888", "size": (WIDTH, HEIGHT)}))
+                    camera.configure(
+                        camera.create_preview_configuration(
+                            main={"format": "RGB888", "size": (WIDTH, HEIGHT)}
+                        )
+                    )
                     camera.start()
-            if data.get('get_viewers'):
-                # Send list of active viewers
-                viewers = []
-                for ws, info in active_connections.items():
-                    viewers.append({
-                        'id': info['id'],
-                        'connected_at': info['connected_at'],
-                        'remote_address': info['remote_address']
-                    })
-                await websocket.send(json.dumps({'viewers': viewers}))
-            if data.get('get_access_log'):
-                # Send access log
-                await websocket.send(json.dumps({'access_log': access_log}))
-        except Exception as e:
-            print(f"Error processing command: {e}")
+                response = {
+                    "settings_updated": True,
+                    "width": WIDTH,
+                    "height": HEIGHT,
+                    "quality": JPEG_QUALITY,
+                }
+            elif command == "get_viewers":
+                response = {
+                    "viewers": [
+                        {
+                            "id": info["id"],
+                            "connected_at": info["connected_at"],
+                            "remote_address": info["remote_address"],
+                        }
+                        for info in active_connections.values()
+                    ]
+                }
+            elif command == "get_access_log":
+                response = {"access_log": access_log}
+            else:
+                raise ValueError("Unknown command")
+
+            await send_encrypted_response(websocket, aes_key, request_id, response)
+        except Exception as error:
+            print(f"Error processing command: {error}")
+            if aes_key is not None and request_id is not None:
+                await send_encrypted_response(
+                    websocket,
+                    aes_key,
+                    request_id,
+                    {"command_error": "Command rejected"},
+                )
 
 
-async def authenticate(websocket):
-    """
-    Wait for the client to send the correct access password.
-    :param websocket: Connected websocket
-    :return: True if authenticated, False otherwise
-    """
-    remote_address = str(websocket.remote_address) if websocket.remote_address else 'unknown'
-    
-    def log_attempt(success, error=None):
-        """Log an authentication attempt."""
-        entry = {
-            'timestamp': datetime.now().isoformat(),
-            'remote_address': remote_address,
-            'success': success,
-            'error': error
-        }
-        access_log.append(entry)
-        # Keep only the last MAX_ACCESS_LOG_ENTRIES entries
-        while len(access_log) > MAX_ACCESS_LOG_ENTRIES:
-            access_log.pop(0)
-    
+async def begin_handshake(websocket):
+    """Handle the only plaintext client request: fetching server key material."""
+    message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
+    if not isinstance(message, str) or len(message) > 4096:
+        raise ValueError("Invalid public-key request")
+    request = json.loads(message)
+    if not isinstance(request, dict) or request.get("type") != "get_public_key":
+        raise ValueError("The first request must fetch the public key")
+
+    session = {"id": secrets.token_urlsafe(24), "used_nonces": {}}
+    await websocket.send(
+        json.dumps(
+            {
+                "type": "server_hello",
+                "protocol": 1,
+                "server_time": int(time.time()),
+                "public_key": COMMAND_PUBLIC_KEY_PEM,
+                "public_key_fingerprint": COMMAND_PUBLIC_KEY_FINGERPRINT,
+                "session_id": session["id"],
+                "password_kdf": {
+                    "name": "PBKDF2",
+                    "hash": "SHA-256",
+                    "iterations": PASSWORD_KDF_ITERATIONS,
+                    "salt": encode_base64(ACCESS_PASSWORD_SALT),
+                },
+                "available_resolutions": [
+                    {"width": width, "height": height}
+                    for width, height in AVAILABLE_RESOLUTIONS
+                ],
+            },
+            separators=(",", ":"),
+        )
+    )
+    return session
+
+
+async def authenticate(websocket, session):
+    """Require an encrypted, fresh access-password proof before streaming."""
+    aes_key = None
+    request_id = None
     try:
         message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-        data = json.loads(message)
-        if data.get('access_password') == ACCESS_PASSWORD:
-            log_attempt(True)
-            await websocket.send(json.dumps({'authenticated': True}))
-            return True
-        else:
-            log_attempt(False, 'Invalid access password')
-            await websocket.send(json.dumps({'authenticated': False, 'error': 'Invalid access password'}))
-            return False
+        data, aes_key, request_id = decrypt_command_envelope(message)
+        validate_authenticated_command(data, session)
+        if data.get("command") != "authenticate":
+            raise ValueError("Expected authenticate command")
+
+        log_access_attempt(websocket, True)
+        await send_encrypted_response(
+            websocket, aes_key, request_id, {"authenticated": True}
+        )
+        return True
     except asyncio.TimeoutError:
-        log_attempt(False, 'Authentication timeout')
-        await websocket.send(json.dumps({'authenticated': False, 'error': 'Authentication timeout'}))
-        return False
-    except Exception as e:
-        log_attempt(False, str(e))
-        print(f"Authentication error: {e}")
-        return False
+        log_access_attempt(websocket, False, "Authentication timeout")
+        await websocket.send(
+            json.dumps(
+                {"type": "handshake_error", "error": "Authentication timeout"}
+            )
+        )
+    except Exception as error:
+        log_access_attempt(websocket, False, "Authentication failed")
+        print(f"Authentication error: {error}")
+        if aes_key is not None and request_id is not None:
+            await send_encrypted_response(
+                websocket,
+                aes_key,
+                request_id,
+                {"authenticated": False, "error": "Authentication failed"},
+            )
+        else:
+            await websocket.send(
+                json.dumps(
+                    {"type": "handshake_error", "error": "Authentication failed"}
+                )
+            )
+    return False
 
 
 async def handle_connection(websocket):
-    """
-    Websocket connection handler
-    :param websocket: Connected websocket
-    :return: None
-    """
+    """Negotiate keys, authenticate, then stream frames and receive commands."""
     global connection_id_counter
-    
-    # Wait for authentication before sending frames
-    if not await authenticate(websocket):
+
+    try:
+        session = await begin_handshake(websocket)
+    except Exception as error:
+        print(f"Handshake error: {error}")
         return
-    
-    # Register this connection
+
+    if not await authenticate(websocket, session):
+        return
+
     connection_id_counter += 1
     connection_info = {
-        'id': connection_id_counter,
-        'connected_at': datetime.now().isoformat(),
-        'remote_address': str(websocket.remote_address) if websocket.remote_address else 'unknown'
+        "id": connection_id_counter,
+        "connected_at": datetime.now().isoformat(),
+        "remote_address": str(websocket.remote_address)
+        if websocket.remote_address
+        else "unknown",
     }
     active_connections[websocket] = connection_info
-    print(f"Client {connection_info['id']} connected from {connection_info['remote_address']}")
-    
+    print(
+        f"Client {connection_info['id']} connected from "
+        f"{connection_info['remote_address']}"
+    )
+
     try:
         sender = asyncio.create_task(send_frames(websocket))
-        receiver = asyncio.create_task(receive_commands(websocket))
-        done, pending = await asyncio.wait(
+        receiver = asyncio.create_task(receive_commands(websocket, session))
+        _, pending = await asyncio.wait(
             [sender, receiver],
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
             task.cancel()
     finally:
-        # Unregister this connection
         if websocket in active_connections:
             print(f"Client {active_connections[websocket]['id']} disconnected")
             del active_connections[websocket]
@@ -196,7 +521,7 @@ async def handle_connection(websocket):
 async def main():
     """Start the WebSocket server."""
     async with websockets.serve(handle_connection, "localhost", 8000):
-        await asyncio.Future()  # Run forever
+        await asyncio.Future()
 
 
 if __name__ == "__main__":

@@ -4,21 +4,32 @@
     <meta charset="UTF-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Test</title>
+    <title>Raspberry Pi Camera Stream</title>
     <script>
-        function $(id){
-            return document.getElementById(id)
+        function $(id) {
+            return document.getElementById(id);
         }
 
         let ws = null;
         let currentUrl = null;
         let encryptionKey = null;
+        let commandPublicKey = null;
+        let commandPasswordHash = null;
+        let commandSessionId = null;
+        let commandClockOffsetSeconds = 0;
+        let authenticated = false;
+        let disconnectStatus = null;
+        let rotationDegrees = 0;
         let bytesReceived = 0;
         let lastBytesReceived = 0;
         let lastSpeedUpdate = Date.now();
         let speedUpdateInterval = null;
+        const pendingResponseKeys = new Map();
 
-        const STORAGE_KEY = 'fpv-stream-settings';
+        const STORAGE_KEY = "fpv-stream-settings";
+        const PUBLIC_KEY_PIN_PREFIX = "fpv-command-key-pin:";
+        const COMMAND_AAD = new TextEncoder().encode("rpi-camera-command-v1");
+        const RESPONSE_AAD_PREFIX = "rpi-camera-response-v1:";
 
         function saveSettings() {
             const settings = {
@@ -26,280 +37,665 @@
                 width: $("width").value,
                 height: $("height").value,
                 quality: $("quality").value,
-                password: $("password").value,
-                accessPassword: $("accessPassword").value
+                password: $("password").value
             };
+            // The access password is deliberately never stored in localStorage.
             localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
         }
 
         function loadSettings() {
             const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) {
-                try {
-                    const settings = JSON.parse(saved);
-                    if (settings.serverUrl) $("serverIp").value = settings.serverUrl;
-                    if (settings.width) $("width").value = settings.width;
-                    if (settings.height) $("height").value = settings.height;
-                    if (settings.quality) $("quality").value = settings.quality;
-                    if (settings.password) $("password").value = settings.password;
-                    if (settings.accessPassword) $("accessPassword").value = settings.accessPassword;
-                } catch (e) {
-                    console.error('Failed to load settings:', e);
+            if (!saved) {
+                return;
+            }
+            try {
+                const settings = JSON.parse(saved);
+                if (settings.serverUrl) $("serverIp").value = settings.serverUrl;
+                if (settings.width) $("width").value = settings.width;
+                if (settings.height) $("height").value = settings.height;
+                if (settings.quality) $("quality").value = settings.quality;
+                if (settings.password) $("password").value = settings.password;
+                if (Object.prototype.hasOwnProperty.call(settings, "accessPassword")) {
+                    delete settings.accessPassword;
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
                 }
+            } catch (error) {
+                console.error("Failed to load settings:", error);
             }
         }
 
-        async function deriveKey(password) {
-            const encoder = new TextEncoder();
-            const data = encoder.encode(password);
-            const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-            return await crypto.subtle.importKey(
-                'raw',
+        function bytesToBase64(bytes) {
+            let binary = "";
+            const chunkSize = 0x8000;
+            for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+            }
+            return btoa(binary);
+        }
+
+        function base64ToBytes(value) {
+            const binary = atob(value);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            return bytes;
+        }
+
+        function randomToken(byteLength = 18) {
+            return bytesToBase64(crypto.getRandomValues(new Uint8Array(byteLength)))
+                .replace(/\+/g, "-")
+                .replace(/\//g, "_")
+                .replace(/=+$/, "");
+        }
+
+        function serverPinStorageKey(address) {
+            const url = new URL(address);
+            return PUBLIC_KEY_PIN_PREFIX + url.origin;
+        }
+
+        function pemToDer(pem) {
+            const base64 = pem
+                .replace("-----BEGIN PUBLIC KEY-----", "")
+                .replace("-----END PUBLIC KEY-----", "")
+                .replace(/\s/g, "");
+            return base64ToBytes(base64);
+        }
+
+        async function sha256Hex(bytes) {
+            const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+            return Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+        }
+
+        async function deriveStreamKey(password) {
+            const hashBuffer = await crypto.subtle.digest(
+                "SHA-256",
+                new TextEncoder().encode(password)
+            );
+            return crypto.subtle.importKey(
+                "raw",
                 hashBuffer,
-                { name: 'AES-GCM' },
+                { name: "AES-GCM" },
                 false,
-                ['decrypt']
+                ["decrypt"]
             );
         }
 
-        async function decryptData(encryptedBuffer) {
+        async function deriveAccessPasswordHash(password, kdf) {
+            if (
+                !kdf ||
+                kdf.name !== "PBKDF2" ||
+                kdf.hash !== "SHA-256" ||
+                !Number.isInteger(kdf.iterations) ||
+                kdf.iterations < 100000 ||
+                kdf.iterations > 1000000
+            ) {
+                throw new Error("Server supplied unsupported password hashing parameters");
+            }
+            const passwordKey = await crypto.subtle.importKey(
+                "raw",
+                new TextEncoder().encode(password),
+                "PBKDF2",
+                false,
+                ["deriveBits"]
+            );
+            const bits = await crypto.subtle.deriveBits(
+                {
+                    name: "PBKDF2",
+                    hash: "SHA-256",
+                    salt: base64ToBytes(kdf.salt),
+                    iterations: kdf.iterations
+                },
+                passwordKey,
+                256
+            );
+            return new Uint8Array(bits);
+        }
+
+        async function decryptFrame(encryptedBuffer) {
             const data = new Uint8Array(encryptedBuffer);
             const nonce = data.slice(0, 12);
             const ciphertext = data.slice(12);
-            
             try {
-                const decrypted = await crypto.subtle.decrypt(
-                    { name: 'AES-GCM', iv: nonce },
+                return await crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv: nonce },
                     encryptionKey,
                     ciphertext
                 );
-                return decrypted;
-            } catch (e) {
-                console.error('Decryption failed:', e);
+            } catch (error) {
+                console.error("Frame decryption failed:", error);
                 return null;
+            }
+        }
+
+        async function processServerHello(response, address) {
+            if (
+                response.protocol !== 1 ||
+                typeof response.public_key !== "string" ||
+                typeof response.session_id !== "string" ||
+                !Number.isInteger(response.server_time)
+            ) {
+                throw new Error("Server returned an invalid command handshake");
+            }
+
+            const publicKeyDer = pemToDer(response.public_key);
+            const fingerprint = await sha256Hex(publicKeyDer);
+            if (fingerprint !== response.public_key_fingerprint) {
+                throw new Error("Server public-key fingerprint is inconsistent");
+            }
+
+            const pinStorageKey = serverPinStorageKey(address);
+            const pinnedFingerprint = localStorage.getItem(pinStorageKey);
+            if (pinnedFingerprint && pinnedFingerprint !== fingerprint) {
+                throw new Error(
+                    "Server public key changed. Verify the server, then use Forget Server Key if the change was intentional."
+                );
+            }
+            commandPublicKey = await crypto.subtle.importKey(
+                "spki",
+                publicKeyDer,
+                { name: "RSA-OAEP", hash: "SHA-256" },
+                false,
+                ["encrypt"]
+            );
+            if (commandPublicKey.algorithm.modulusLength < 3072) {
+                throw new Error("Server command key is smaller than 3072 bits");
+            }
+            commandSessionId = response.session_id;
+            commandClockOffsetSeconds = response.server_time - Math.floor(Date.now() / 1000);
+            commandPasswordHash = await deriveAccessPasswordHash(
+                $("accessPassword").value,
+                response.password_kdf
+            );
+            if (!pinnedFingerprint) {
+                localStorage.setItem(pinStorageKey, fingerprint);
+            }
+
+            $("serverKeyStatus").textContent = "Server key: " + fingerprint.slice(0, 16) + "…";
+            populateResolutions(response.available_resolutions || []);
+        }
+
+        async function sendSecureCommand(command) {
+            const socket = ws;
+            if (
+                !socket ||
+                socket.readyState !== WebSocket.OPEN ||
+                !commandPublicKey ||
+                !commandPasswordHash ||
+                !commandSessionId
+            ) {
+                throw new Error("The secure command channel is not ready");
+            }
+
+            const aesKeyBytes = crypto.getRandomValues(new Uint8Array(32));
+            const aesKey = await crypto.subtle.importKey(
+                "raw",
+                aesKeyBytes,
+                { name: "AES-GCM" },
+                false,
+                ["encrypt", "decrypt"]
+            );
+            const nonce = crypto.getRandomValues(new Uint8Array(12));
+            const requestId = randomToken();
+            const payload = {
+                ...command,
+                request_id: requestId,
+                session_id: commandSessionId,
+                request_nonce: randomToken(),
+                timestamp: Math.floor(Date.now() / 1000) + commandClockOffsetSeconds,
+                access_password_hash: bytesToBase64(commandPasswordHash)
+            };
+            const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+            const ciphertext = await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv: nonce, additionalData: COMMAND_AAD },
+                aesKey,
+                plaintext
+            );
+            const encryptedKey = await crypto.subtle.encrypt(
+                { name: "RSA-OAEP", label: COMMAND_AAD },
+                commandPublicKey,
+                aesKeyBytes
+            );
+
+            if (ws !== socket || socket.readyState !== WebSocket.OPEN) {
+                throw new Error("Connection changed while encrypting the command");
+            }
+            pendingResponseKeys.set(requestId, aesKey);
+            socket.send(JSON.stringify({
+                type: "encrypted_command",
+                encrypted_key: bytesToBase64(new Uint8Array(encryptedKey)),
+                nonce: bytesToBase64(nonce),
+                ciphertext: bytesToBase64(new Uint8Array(ciphertext))
+            }));
+        }
+
+        async function decryptSecureResponse(response) {
+            const aesKey = pendingResponseKeys.get(response.request_id);
+            if (!aesKey) {
+                throw new Error("Encrypted response has no matching request");
+            }
+            pendingResponseKeys.delete(response.request_id);
+            const aad = new TextEncoder().encode(RESPONSE_AAD_PREFIX + response.request_id);
+            const plaintext = await crypto.subtle.decrypt(
+                {
+                    name: "AES-GCM",
+                    iv: base64ToBytes(response.nonce),
+                    additionalData: aad
+                },
+                aesKey,
+                base64ToBytes(response.ciphertext)
+            );
+            return JSON.parse(new TextDecoder().decode(plaintext));
+        }
+
+        function startSpeedDisplay() {
+            bytesReceived = 0;
+            lastBytesReceived = 0;
+            lastSpeedUpdate = Date.now();
+            if (speedUpdateInterval) {
+                clearInterval(speedUpdateInterval);
+            }
+            speedUpdateInterval = setInterval(() => {
+                const now = Date.now();
+                const elapsed = (now - lastSpeedUpdate) / 1000;
+                const bytesDiff = bytesReceived - lastBytesReceived;
+                const speed = bytesDiff / elapsed;
+                const speedText = speed >= 1024 * 1024
+                    ? (speed / (1024 * 1024)).toFixed(2) + " MB/s"
+                    : (speed / 1024).toFixed(2) + " KB/s";
+                $("status").textContent = "Connected - " + speedText;
+                lastBytesReceived = bytesReceived;
+                lastSpeedUpdate = now;
+            }, 1000);
+        }
+
+        function handleControlResponse(response) {
+            if (response.authenticated === true) {
+                authenticated = true;
+                $("status").textContent = "Connected - 0 KB/s";
+                startSpeedDisplay();
+                return;
+            }
+            if (response.authenticated === false) {
+                disconnectStatus = "Authentication failed";
+                $("status").textContent = disconnectStatus;
+                ws.close();
+                return;
+            }
+            if (response.viewers) {
+                displayViewers(response.viewers);
+                return;
+            }
+            if (response.access_log) {
+                displayAccessLog(response.access_log);
+                return;
+            }
+            if (response.settings_updated) {
+                $("commandStatus").textContent = "Settings updated";
+                return;
+            }
+            if (response.command_error) {
+                $("commandStatus").textContent = response.command_error;
             }
         }
 
         async function connect() {
             const address = $("serverIp").value;
-            const password = $("password").value;
-            const status = $("status");
+            const streamPassword = $("password").value;
+            const accessPassword = $("accessPassword").value;
 
-            if (!password) {
+            if (!window.crypto || !window.crypto.subtle) {
+                alert("This browser context does not provide the Web Crypto API");
+                return;
+            }
+            if (!streamPassword) {
                 alert("Please enter the decryption password");
                 return;
             }
+            if (!accessPassword) {
+                alert("Please enter the access password");
+                return;
+            }
 
-            // Save settings when connecting
             saveSettings();
-
-            // Derive encryption key from password
-            encryptionKey = await deriveKey(password);
+            encryptionKey = await deriveStreamKey(streamPassword);
 
             if (ws) {
                 ws.close();
             }
+            authenticated = false;
+            commandPublicKey = null;
+            commandPasswordHash = null;
+            commandSessionId = null;
+            commandClockOffsetSeconds = 0;
+            pendingResponseKeys.clear();
+            disconnectStatus = null;
+            $("status").textContent = "Connecting...";
+            $("commandStatus").textContent = "";
 
-            status.textContent = "Connecting...";
+            const socket = new WebSocket(address);
+            ws = socket;
+            socket.binaryType = "arraybuffer";
 
-            // Connect to our server:
-            ws = new WebSocket(address);
-            ws.binaryType = "blob";
-
-            ws.onopen = function() {
-                status.textContent = "Authenticating...";
-                // Send access password for authentication
-                const accessPassword = $("accessPassword").value;
-                ws.send(JSON.stringify({ access_password: accessPassword }));
+            socket.onopen = function() {
+                $("status").textContent = "Requesting server key...";
+                socket.send(JSON.stringify({ type: "get_public_key" }));
             };
 
-            ws.onclose = function() {
-                status.textContent = "Disconnected";
+            socket.onclose = function() {
+                if (ws !== socket) {
+                    return;
+                }
+                authenticated = false;
+                $("status").textContent = disconnectStatus || "Disconnected";
+                pendingResponseKeys.clear();
                 if (speedUpdateInterval) {
                     clearInterval(speedUpdateInterval);
                     speedUpdateInterval = null;
                 }
             };
 
-            ws.onerror = function() {
-                status.textContent = "Error";
+            socket.onerror = function() {
+                if (ws === socket) {
+                    disconnectStatus = "Connection error";
+                    $("status").textContent = disconnectStatus;
+                }
             };
 
-            let authenticated = false;
-
-            // This will run when data comes through the WebSocket:
-            ws.onmessage = async function (event) {
-                // Check if this is an authentication response (JSON text)
-                if (!authenticated && typeof event.data === 'string') {
-                    try {
+            socket.onmessage = async function(event) {
+                try {
+                    if (typeof event.data === "string") {
                         const response = JSON.parse(event.data);
-                        if (response.authenticated === true) {
-                            authenticated = true;
-                            status.textContent = "Connected - 0 KB/s";
-                            bytesReceived = 0;
-                            lastBytesReceived = 0;
-                            lastSpeedUpdate = Date.now();
-                            // Update speed display every second
-                            speedUpdateInterval = setInterval(() => {
-                                const now = Date.now();
-                                const elapsed = (now - lastSpeedUpdate) / 1000;
-                                const bytesDiff = bytesReceived - lastBytesReceived;
-                                const speed = bytesDiff / elapsed;
-                                let speedText;
-                                if (speed >= 1024 * 1024) {
-                                    speedText = (speed / (1024 * 1024)).toFixed(2) + " MB/s";
-                                } else {
-                                    speedText = (speed / 1024).toFixed(2) + " KB/s";
-                                }
-                                status.textContent = "Connected - " + speedText;
-                                lastBytesReceived = bytesReceived;
-                                lastSpeedUpdate = now;
-                            }, 1000);
-                        } else {
-                            status.textContent = "Authentication failed: " + (response.error || "Unknown error");
-                            ws.close();
+                        if (response.type === "server_hello") {
+                            $("status").textContent = "Verifying server key...";
+                            await processServerHello(response, address);
+                            $("status").textContent = "Authenticating...";
+                            await sendSecureCommand({ command: "authenticate" });
+                            return;
                         }
+                        if (response.type === "encrypted_response") {
+                            const plaintextResponse = await decryptSecureResponse(response);
+                            handleControlResponse(plaintextResponse);
+                            return;
+                        }
+                        if (response.type === "handshake_error") {
+                            throw new Error(response.error || "Handshake failed");
+                        }
+                        throw new Error("Unexpected plaintext server message");
+                    }
+
+                    if (!authenticated) {
                         return;
-                    } catch (e) {
-                        // Not JSON, might be binary data
                     }
-                }
-
-                if (!authenticated) {
-                    return;
-                }
-
-                // Check if this is a viewers list response (JSON text)
-                if (typeof event.data === 'string') {
-                    try {
-                        const response = JSON.parse(event.data);
-                        if (response.viewers) {
-                            displayViewers(response.viewers);
-                            return;
-                        }
-                        if (response.access_log) {
-                            displayAccessLog(response.access_log);
-                            return;
-                        }
-                    } catch (e) {
-                        // Not JSON, continue
+                    bytesReceived += event.data.byteLength;
+                    const decryptedData = await decryptFrame(event.data);
+                    if (!decryptedData) {
+                        return;
                     }
-                }
-
-                const encryptedData = await event.data.arrayBuffer();
-                bytesReceived += encryptedData.byteLength;
-                const decryptedData = await decryptData(encryptedData);
-                
-                if (decryptedData) {
-                    // Revoke previous URL to prevent memory leaks
                     if (currentUrl) {
                         URL.revokeObjectURL(currentUrl);
                     }
-                    // Create blob URL from decrypted data
-                    const blob = new Blob([decryptedData], { type: 'image/jpeg' });
+                    const blob = new Blob([decryptedData], { type: "image/jpeg" });
                     currentUrl = URL.createObjectURL(blob);
                     $("stream").src = currentUrl;
+                } catch (error) {
+                    console.error("WebSocket message error:", error);
+                    disconnectStatus = error.message || "Protocol error";
+                    $("status").textContent = disconnectStatus;
+                    socket.close();
                 }
-            }
+            };
         }
 
-        function updateSettings() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
+        function requireAuthenticatedConnection() {
+            if (!ws || ws.readyState !== WebSocket.OPEN || !authenticated) {
                 alert("Not connected");
+                return false;
+            }
+            return true;
+        }
+
+        async function updateSettings() {
+            if (!requireAuthenticatedConnection()) {
                 return;
             }
-            
-            const width = parseInt($("width").value);
-            const height = parseInt($("height").value);
-            const quality = parseInt($("quality").value);
-            
-            const payload = {
-                width: width,
-                height: height,
-                quality: quality
-            };
-            
-            ws.send(JSON.stringify(payload));
-            
-            // Save settings when updating
+            const width = Number.parseInt($("width").value, 10);
+            const height = Number.parseInt($("height").value, 10);
+            const quality = Number.parseInt($("quality").value, 10);
+            if (
+                !Number.isInteger(width) || width < 1 ||
+                !Number.isInteger(height) || height < 1 ||
+                !Number.isInteger(quality) || quality < 1 || quality > 100
+            ) {
+                alert("Enter a positive width/height and a JPEG quality from 1 to 100");
+                return;
+            }
+
+            $("commandStatus").textContent = "Updating settings...";
+            await sendSecureCommand({
+                command: "update_settings",
+                width,
+                height,
+                quality
+            });
             saveSettings();
         }
 
-        function getViewers() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                alert("Not connected");
+        async function getViewers() {
+            if (requireAuthenticatedConnection()) {
+                await sendSecureCommand({ command: "get_viewers" });
+            }
+        }
+
+        async function getAccessLog() {
+            if (requireAuthenticatedConnection()) {
+                await sendSecureCommand({ command: "get_access_log" });
+            }
+        }
+
+        function populateResolutions(resolutions) {
+            const select = $("resolutionPreset");
+            select.replaceChildren();
+            const customOption = document.createElement("option");
+            customOption.value = "custom";
+            customOption.textContent = "Custom";
+            select.appendChild(customOption);
+
+            const seen = new Set();
+            resolutions.forEach(resolution => {
+                const width = Number.parseInt(resolution.width, 10);
+                const height = Number.parseInt(resolution.height, 10);
+                if (width < 1 || height < 1) {
+                    return;
+                }
+                const value = width + "x" + height;
+                if (seen.has(value)) {
+                    return;
+                }
+                seen.add(value);
+                const option = document.createElement("option");
+                option.value = value;
+                option.textContent = value;
+                select.appendChild(option);
+            });
+            select.disabled = resolutions.length === 0;
+            syncResolutionSelection();
+        }
+
+        function useSelectedResolution() {
+            const value = $("resolutionPreset").value;
+            if (value === "custom") {
                 return;
             }
-            ws.send(JSON.stringify({ get_viewers: true }));
+            const [width, height] = value.split("x");
+            $("width").value = width;
+            $("height").value = height;
+        }
+
+        function syncResolutionSelection() {
+            const select = $("resolutionPreset");
+            const current = $("width").value + "x" + $("height").value;
+            const hasPreset = Array.from(select.options).some(option => option.value === current);
+            select.value = hasPreset ? current : "custom";
+        }
+
+        function rotateImage(delta) {
+            rotationDegrees = (rotationDegrees + delta + 360) % 360;
+            $("stream").style.transform = "rotate(" + rotationDegrees + "deg)";
+            $("rotationValue").textContent = rotationDegrees + "°";
+        }
+
+        function forgetServerKey() {
+            const address = $("serverIp").value;
+            const message = "Forget the pinned key for " + address + "? Only do this after verifying the server key changed intentionally.";
+            if (confirm(message)) {
+                localStorage.removeItem(serverPinStorageKey(address));
+                $("serverKeyStatus").textContent = "Server key pin removed";
+            }
         }
 
         function displayViewers(viewers) {
             const viewersList = $("viewersList");
+            viewersList.replaceChildren();
             if (viewers.length === 0) {
-                viewersList.innerHTML = "<em>No active viewers</em>";
-            } else {
-                let html = "<strong>Active Viewers (" + viewers.length + "):</strong><ul>";
-                viewers.forEach(v => {
-                    html += "<li>ID: " + v.id + " | Connected: " + v.connected_at + " | Address: " + v.remote_address + "</li>";
-                });
-                html += "</ul>";
-                viewersList.innerHTML = html;
-            }
-        }
-
-        function getAccessLog() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                alert("Not connected");
+                const empty = document.createElement("em");
+                empty.textContent = "No active viewers";
+                viewersList.appendChild(empty);
                 return;
             }
-            ws.send(JSON.stringify({ get_access_log: true }));
+            const heading = document.createElement("strong");
+            heading.textContent = "Active Viewers (" + viewers.length + "):";
+            const list = document.createElement("ul");
+            viewers.forEach(viewer => {
+                const item = document.createElement("li");
+                item.textContent = "ID: " + viewer.id + " | Connected: " +
+                    viewer.connected_at + " | Address: " + viewer.remote_address;
+                list.appendChild(item);
+            });
+            viewersList.append(heading, list);
         }
 
         function displayAccessLog(log) {
             const accessLogDiv = $("accessLog");
+            accessLogDiv.replaceChildren();
             if (log.length === 0) {
-                accessLogDiv.innerHTML = "<em>No access log entries</em>";
-            } else {
-                let html = "<strong>Access Log (" + log.length + " entries):</strong><ul>";
-                // Show most recent first
-                for (let i = log.length - 1; i >= 0; i--) {
-                    const entry = log[i];
-                    const status = entry.success ? '<span style="color: green;">SUCCESS</span>' : '<span style="color: red;">FAILED</span>';
-                    const errorMsg = entry.error ? " - " + entry.error : "";
-                    html += "<li>" + entry.timestamp + " | " + entry.remote_address + " | " + status + errorMsg + "</li>";
-                }
-                html += "</ul>";
-                accessLogDiv.innerHTML = html;
+                const empty = document.createElement("em");
+                empty.textContent = "No access log entries";
+                accessLogDiv.appendChild(empty);
+                return;
             }
+            const heading = document.createElement("strong");
+            heading.textContent = "Access Log (" + log.length + " entries):";
+            const list = document.createElement("ul");
+            for (let i = log.length - 1; i >= 0; i--) {
+                const entry = log[i];
+                const item = document.createElement("li");
+                const result = entry.success ? "SUCCESS" : "FAILED";
+                item.textContent = entry.timestamp + " | " + entry.remote_address +
+                    " | " + result + (entry.error ? " - " + entry.error : "");
+                item.className = entry.success ? "success" : "failure";
+                list.appendChild(item);
+            }
+            accessLogDiv.append(heading, list);
         }
 
-        // Load settings when page loads
-        window.addEventListener('DOMContentLoaded', loadSettings);
+        window.addEventListener("DOMContentLoaded", () => {
+            loadSettings();
+            $("width").addEventListener("input", syncResolutionSelection);
+            $("height").addEventListener("input", syncResolutionSelection);
+        });
     </script>
     <style>
         body {
-            background-image: element("#stream"); /* Set body background to streamed element */
+            margin: 16px;
+            font-family: sans-serif;
+        }
+
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        input[type="number"] {
+            width: 85px;
+        }
+
+        #serverIp {
+            width: 300px;
+        }
+
+        #password,
+        #accessPassword {
+            width: 150px;
+        }
+
+        #serverKeyStatus,
+        #commandStatus {
+            color: #555;
+            font-size: 0.9rem;
+        }
+
+        #streamViewport {
+            display: flex;
+            min-height: 200px;
+            overflow: auto;
+            padding: 16px;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #stream {
+            display: block;
+            max-width: 100%;
+            transform-origin: center;
+            transition: transform 150ms ease;
+        }
+
+        .success {
+            color: green;
+        }
+
+        .failure {
+            color: red;
         }
     </style>
 </head>
 <body>
-    <div style="margin-bottom: 10px;">
-        <input type="text" id="serverIp" value="wss://128.189.92.96:8000/" style="width: 300px;">
-        <input type="password" id="password" placeholder="Decryption Password" style="width: 150px;">
-        <input type="password" id="accessPassword" placeholder="Access Password" style="width: 150px;">
-        <button onclick="connect()">Connect</button>
+    <div class="controls">
+        <input type="text" id="serverIp" value="wss://128.189.92.96:8000/" aria-label="Server URL">
+        <input type="password" id="password" placeholder="Decryption Password">
+        <input type="password" id="accessPassword" placeholder="Access Password" autocomplete="current-password">
+        <button type="button" onclick="connect()">Connect</button>
+        <button type="button" onclick="forgetServerKey()">Forget Server Key</button>
         <span id="status">Disconnected</span>
+        <span id="serverKeyStatus"></span>
     </div>
-    <div style="margin-bottom: 10px;">
-        <label>Width: <input type="number" id="width" value="640"></label>
-        <label>Height: <input type="number" id="height" value="480"></label>
-        <label>Quality: <input type="number" id="quality" value="70"></label>
-        <button onclick="updateSettings()">Update Settings</button>
-        <button onclick="getViewers()">Get Active Viewers</button>
-        <button onclick="getAccessLog()">Get Access Log</button>
+    <div class="controls">
+        <label>Resolution:
+            <select id="resolutionPreset" onchange="useSelectedResolution()" disabled>
+                <option value="custom">Custom</option>
+            </select>
+        </label>
+        <label>Width: <input type="number" id="width" value="640" min="1"></label>
+        <label>Height: <input type="number" id="height" value="480" min="1"></label>
+        <label>Quality: <input type="number" id="quality" value="70" min="1" max="100"></label>
+        <button type="button" onclick="updateSettings()">Update Settings</button>
+        <button type="button" onclick="getViewers()">Get Active Viewers</button>
+        <button type="button" onclick="getAccessLog()">Get Access Log</button>
+        <span id="commandStatus"></span>
     </div>
-    <div id="viewersList" style="margin-bottom: 10px;"></div>
-    <div id="accessLog" style="margin-bottom: 10px;"></div>
-    <img src="" id="stream" class="bgimg">
+    <div class="controls">
+        <button type="button" onclick="rotateImage(-90)" aria-label="Rotate image counterclockwise">↶ Counterclockwise</button>
+        <button type="button" onclick="rotateImage(90)" aria-label="Rotate image clockwise">↷ Clockwise</button>
+        <span id="rotationValue">0°</span>
+    </div>
+    <div id="viewersList"></div>
+    <div id="accessLog"></div>
+    <div id="streamViewport">
+        <img src="" id="stream" alt="Camera stream">
+    </div>
 </body>
 </html>
