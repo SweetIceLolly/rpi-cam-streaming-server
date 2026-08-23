@@ -480,7 +480,7 @@ def disarm_motion_detection():
     print("Motion detection disarmed")
 
 
-def send_motion_email(detected_at):
+def send_motion_email(detected_at, capture):
     """Send one motion alert through Gmail's TLS-protected SMTP endpoint."""
     message = EmailMessage()
     message["From"] = GMAIL_ADDRESS
@@ -492,6 +492,12 @@ def send_motion_email(detected_at):
         f"Camera host: {socket.gethostname()}\n\n"
         "Another alert will be eligible only after the configured quiet period."
     )
+    message.add_attachment(
+        capture,
+        maintype="image",
+        subtype="jpeg",
+        filename=detected_at.strftime("motion-%Y%m%d-%H%M%S.jpg"),
+    )
 
     tls_context = ssl.create_default_context()
     with smtplib.SMTP_SSL(
@@ -501,9 +507,9 @@ def send_motion_email(detected_at):
         smtp.send_message(message)
 
 
-async def deliver_motion_email(detected_at):
+async def deliver_motion_email(detected_at, capture):
     try:
-        await asyncio.to_thread(send_motion_email, detected_at)
+        await asyncio.to_thread(send_motion_email, detected_at, capture)
         print(f"Motion notification sent to {MOTION_EMAIL_TO}")
     except Exception as error:
         # This event remains consumed even if delivery fails, which prevents a
@@ -511,10 +517,21 @@ async def deliver_motion_email(detected_at):
         print(f"Unable to send motion notification: {error}")
 
 
-def schedule_motion_email(detected_at):
-    task = asyncio.create_task(deliver_motion_email(detected_at))
+def schedule_motion_email(detected_at, capture):
+    task = asyncio.create_task(deliver_motion_email(detected_at, capture))
     motion_email_tasks.add(task)
     task.add_done_callback(motion_email_tasks.discard)
+
+
+async def capture_motion_jpeg():
+    """Capture and encode the current full-resolution main camera frame."""
+    async with camera_lock:
+        frame = camera.capture_array("main")
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    encoded, buffer = cv2.imencode(".jpg", frame, encode_params)
+    if not encoded:
+        raise RuntimeError("OpenCV could not encode the motion capture")
+    return bytes(buffer)
 
 
 def extract_luminance_frame(frame, stream_size):
@@ -576,7 +593,14 @@ async def motion_detection_loop():
                 motion_period_active = True
                 detected_at = datetime.now().astimezone()
                 print(f"Motion detected at {detected_at.isoformat()}")
-                schedule_motion_email(detected_at)
+                try:
+                    capture = await capture_motion_jpeg()
+                except Exception as error:
+                    # Do not send an incomplete alert: the next motion period can
+                    # try again after the configured quiet interval.
+                    print(f"Unable to capture motion notification image: {error}")
+                else:
+                    schedule_motion_email(detected_at, capture)
         else:
             motion_consecutive_frames = 0
             if (
