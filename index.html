@@ -314,6 +314,7 @@
                 authenticated = true;
                 $("status").textContent = "Connected - 0 KB/s";
                 startSpeedDisplay();
+                displayMotionStatus(response);
                 return;
             }
             if (response.authenticated === false) {
@@ -332,6 +333,15 @@
             }
             if (response.settings_updated) {
                 $("commandStatus").textContent = "Settings updated";
+                return;
+            }
+            if (response.motion_error) {
+                displayMotionStatus(response);
+                $("motionStatus").textContent = response.motion_error;
+                return;
+            }
+            if (Object.prototype.hasOwnProperty.call(response, "motion_armed")) {
+                displayMotionStatus(response);
                 return;
             }
             if (response.command_error) {
@@ -372,6 +382,7 @@
             disconnectStatus = null;
             $("status").textContent = "Connecting...";
             $("commandStatus").textContent = "";
+            disableMotionControls("Connecting to read motion status...");
 
             const socket = new WebSocket(address);
             ws = socket;
@@ -389,6 +400,7 @@
                 authenticated = false;
                 $("status").textContent = disconnectStatus || "Disconnected";
                 pendingResponseKeys.clear();
+                disableMotionControls("Reconnect to read motion status");
                 if (speedUpdateInterval) {
                     clearInterval(speedUpdateInterval);
                     speedUpdateInterval = null;
@@ -463,11 +475,11 @@
             const height = Number.parseInt($("height").value, 10);
             const quality = Number.parseInt($("quality").value, 10);
             if (
-                !Number.isInteger(width) || width < 1 ||
-                !Number.isInteger(height) || height < 1 ||
+                !Number.isInteger(width) || width < 2 ||
+                !Number.isInteger(height) || height < 2 ||
                 !Number.isInteger(quality) || quality < 1 || quality > 100
             ) {
-                alert("Enter a positive width/height and a JPEG quality from 1 to 100");
+                alert("Enter width/height of at least 2 and a JPEG quality from 1 to 100");
                 return;
             }
 
@@ -490,6 +502,45 @@
         async function getAccessLog() {
             if (requireAuthenticatedConnection()) {
                 await sendSecureCommand({ command: "get_access_log" });
+            }
+        }
+
+        function disableMotionControls(statusText) {
+            $("armMotion").disabled = true;
+            $("disarmMotion").disabled = true;
+            $("motionStatus").textContent = statusText;
+        }
+
+        function displayMotionStatus(response) {
+            const armed = response.motion_armed === true;
+            const configured = response.motion_email_configured === true;
+            $("armMotion").disabled = armed || !configured;
+            $("disarmMotion").disabled = !armed;
+            if (armed) {
+                $("motionStatus").textContent =
+                    "Armed — a new email is eligible after " +
+                    response.motion_clear_seconds + " seconds without motion";
+            } else if (!configured) {
+                $("motionStatus").textContent =
+                    "Disarmed — configure Gmail on the server before arming";
+            } else {
+                $("motionStatus").textContent = "Disarmed";
+            }
+        }
+
+        async function setMotionArmed(shouldArm) {
+            if (!requireAuthenticatedConnection()) {
+                return;
+            }
+            disableMotionControls(shouldArm ? "Arming..." : "Disarming...");
+            try {
+                await sendSecureCommand({
+                    command: shouldArm
+                        ? "arm_motion_detection"
+                        : "disarm_motion_detection"
+                });
+            } catch (error) {
+                $("motionStatus").textContent = error.message;
             }
         }
 
@@ -679,8 +730,8 @@
                 <option value="custom">Custom</option>
             </select>
         </label>
-        <label>Width: <input type="number" id="width" value="640" min="1"></label>
-        <label>Height: <input type="number" id="height" value="480" min="1"></label>
+        <label>Width: <input type="number" id="width" value="640" min="2"></label>
+        <label>Height: <input type="number" id="height" value="480" min="2"></label>
         <label>Quality: <input type="number" id="quality" value="70" min="1" max="100"></label>
         <button type="button" onclick="updateSettings()">Update Settings</button>
         <button type="button" onclick="getViewers()">Get Active Viewers</button>
@@ -691,6 +742,11 @@
         <button type="button" onclick="rotateImage(-90)" aria-label="Rotate image counterclockwise">↶ Counterclockwise</button>
         <button type="button" onclick="rotateImage(90)" aria-label="Rotate image clockwise">↷ Clockwise</button>
         <span id="rotationValue">0°</span>
+    </div>
+    <div class="controls">
+        <button type="button" id="armMotion" onclick="setMotionArmed(true)" disabled>Arm Motion Detection</button>
+        <button type="button" id="disarmMotion" onclick="setMotionArmed(false)" disabled>Disarm Motion Detection</button>
+        <span id="motionStatus">Connect to read motion status</span>
     </div>
     <div id="viewersList"></div>
     <div id="accessLog"></div>

@@ -20,15 +20,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import asyncio
 import base64
 import binascii
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import smtplib
+import socket
+import ssl
 import subprocess
 import time
 from datetime import datetime
+from email.message import EmailMessage
 
 import cv2
 import websockets
@@ -42,6 +47,42 @@ from picamera2 import Picamera2
 JPEG_QUALITY = 70
 WIDTH = 640
 HEIGHT = 480
+
+# Motion detection settings. A low-resolution luminance stream keeps CPU use
+# modest enough for a Raspberry Pi 3 B+.
+MOTION_MAX_WIDTH = 320
+MOTION_MAX_HEIGHT = 240
+
+
+def load_bounded_number(name, default, minimum, maximum, number_type=float):
+    """Load a numeric environment setting and reject unsafe values."""
+    value = number_type(os.environ.get(name, default))
+    if value < minimum or value > maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+MOTION_CLEAR_SECONDS = load_bounded_number(
+    "MOTION_CLEAR_SECONDS", 60, 1, 86_400
+)
+MOTION_SAMPLE_INTERVAL_SECONDS = load_bounded_number(
+    "MOTION_SAMPLE_INTERVAL_SECONDS", 0.5, 0.2, 10
+)
+MOTION_PIXEL_THRESHOLD = load_bounded_number(
+    "MOTION_PIXEL_THRESHOLD", 25, 1, 255, int
+)
+MOTION_MIN_AREA_RATIO = load_bounded_number(
+    "MOTION_MIN_AREA_RATIO", 0.012, 0.0001, 1
+)
+MOTION_BACKGROUND_ALPHA = load_bounded_number(
+    "MOTION_BACKGROUND_ALPHA", 0.05, 0.001, 1
+)
+MOTION_WARMUP_FRAMES = load_bounded_number(
+    "MOTION_WARMUP_FRAMES", 6, 1, 1000, int
+)
+MOTION_REQUIRED_FRAMES = load_bounded_number(
+    "MOTION_REQUIRED_FRAMES", 2, 1, 100, int
+)
 
 # Command protocol settings
 COMMAND_AAD = b"rpi-camera-command-v1"
@@ -60,6 +101,15 @@ def load_password(password_file, env_var, default_value):
             return password_handle.read().strip()
     print(f"{password_file} file not found, using environment/default password.")
     return os.environ.get(env_var, default_value)
+
+
+def load_optional_secret(value_env_var, file_env_var):
+    """Load an optional secret from a named file or environment variable."""
+    secret_file = os.environ.get(file_env_var)
+    if secret_file:
+        with open(secret_file, "r", encoding="utf-8") as secret_handle:
+            return secret_handle.read().strip()
+    return os.environ.get(value_env_var, "").strip()
 
 
 def load_or_create_command_private_key(key_path):
@@ -125,6 +175,44 @@ def discover_camera_resolutions():
     return resolutions
 
 
+class MotionDetector:
+    """Adaptive-background motion detector operating on small grayscale frames."""
+
+    def __init__(self):
+        self.background = None
+        self.frames_seen = 0
+
+    def reset(self):
+        self.background = None
+        self.frames_seen = 0
+
+    def detects_motion(self, luminance_frame):
+        blurred = cv2.GaussianBlur(luminance_frame, (7, 7), 0)
+        if self.background is None:
+            self.background = blurred.astype("float32")
+            self.frames_seen = 1
+            return False
+
+        background_frame = cv2.convertScaleAbs(self.background)
+        frame_delta = cv2.absdiff(blurred, background_frame)
+        cv2.accumulateWeighted(
+            blurred, self.background, MOTION_BACKGROUND_ALPHA
+        )
+        self.frames_seen += 1
+        if self.frames_seen <= MOTION_WARMUP_FRAMES:
+            return False
+
+        thresholded = cv2.threshold(
+            frame_delta, MOTION_PIXEL_THRESHOLD, 255, cv2.THRESH_BINARY
+        )[1]
+        thresholded = cv2.dilate(thresholded, None, iterations=2)
+        contours = cv2.findContours(
+            thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )[-2]
+        minimum_area = luminance_frame.size * MOTION_MIN_AREA_RATIO
+        return any(cv2.contourArea(contour) >= minimum_area for contour in contours)
+
+
 def encode_base64(data):
     return base64.b64encode(data).decode("ascii")
 
@@ -146,6 +234,20 @@ encryption_password = load_password("STREAM_PASSWORD", "STREAM_PASSWORD", "chang
 access_password = load_password("ACCESS_PASSWORD", "ACCESS_PASSWORD", "accessme")
 ENCRYPTION_KEY = hashlib.sha256(encryption_password.encode("utf-8")).digest()
 AESGCM_CIPHER = AESGCM(ENCRYPTION_KEY)
+
+# Gmail SMTP settings. Prefer GMAIL_APP_PASSWORD_FILE so the app password does
+# not appear in shell history or process configuration output.
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "").strip()
+GMAIL_APP_PASSWORD = load_optional_secret(
+    "GMAIL_APP_PASSWORD", "GMAIL_APP_PASSWORD_FILE"
+).replace(" ", "")
+MOTION_EMAIL_TO = os.environ.get("MOTION_EMAIL_TO", GMAIL_ADDRESS).strip()
+MOTION_EMAIL_SUBJECT = os.environ.get(
+    "MOTION_EMAIL_SUBJECT", "Raspberry Pi camera motion detected"
+).strip()
+MOTION_EMAIL_CONFIGURED = bool(
+    GMAIL_ADDRESS and GMAIL_APP_PASSWORD and MOTION_EMAIL_TO
+)
 
 # The persistent key allows clients to pin the server identity between restarts.
 DEFAULT_COMMAND_KEY_PATH = os.path.join(
@@ -184,12 +286,38 @@ AVAILABLE_RESOLUTIONS = discover_camera_resolutions()
 
 # Start video capture with Raspberry Pi camera
 camera = Picamera2()
-camera.configure(
-    camera.create_preview_configuration(
-        main={"format": "RGB888", "size": (WIDTH, HEIGHT)}
+
+
+def get_motion_stream_size(width, height):
+    """Return an even low-resolution size no larger than the main stream."""
+    motion_width = min(MOTION_MAX_WIDTH, width)
+    motion_height = min(MOTION_MAX_HEIGHT, height)
+    return motion_width - (motion_width % 2), motion_height - (motion_height % 2)
+
+
+def create_camera_configuration(width, height):
+    motion_size = get_motion_stream_size(width, height)
+    configuration = camera.create_preview_configuration(
+        main={"format": "RGB888", "size": (width, height)},
+        lores={"format": "YUV420", "size": motion_size},
     )
-)
+    return configuration, motion_size
+
+
+camera_configuration, motion_stream_size = create_camera_configuration(WIDTH, HEIGHT)
+camera.configure(camera_configuration)
 camera.start()
+camera_lock = asyncio.Lock()
+
+# Motion state is server-wide. The detector task sleeps on this event while
+# disarmed and therefore performs no captures or image processing.
+motion_armed = False
+motion_period_active = False
+motion_last_detected_at = None
+motion_consecutive_frames = 0
+motion_detector = MotionDetector()
+motion_armed_event = asyncio.Event()
+motion_email_tasks = set()
 
 # Active connections tracking
 active_connections = {}  # websocket -> connection_info dict
@@ -316,10 +444,159 @@ async def send_encrypted_response(websocket, aes_key, request_id, payload):
     )
 
 
+def motion_status_payload():
+    return {
+        "motion_armed": motion_armed,
+        "motion_email_configured": MOTION_EMAIL_CONFIGURED,
+        "motion_clear_seconds": MOTION_CLEAR_SECONDS,
+    }
+
+
+def arm_motion_detection():
+    global motion_armed, motion_period_active
+    global motion_last_detected_at, motion_consecutive_frames
+
+    if motion_armed:
+        return
+    motion_detector.reset()
+    motion_period_active = False
+    motion_last_detected_at = None
+    motion_consecutive_frames = 0
+    motion_armed = True
+    motion_armed_event.set()
+    print("Motion detection armed")
+
+
+def disarm_motion_detection():
+    global motion_armed, motion_period_active
+    global motion_last_detected_at, motion_consecutive_frames
+
+    motion_armed = False
+    motion_armed_event.clear()
+    motion_detector.reset()
+    motion_period_active = False
+    motion_last_detected_at = None
+    motion_consecutive_frames = 0
+    print("Motion detection disarmed")
+
+
+def send_motion_email(detected_at):
+    """Send one motion alert through Gmail's TLS-protected SMTP endpoint."""
+    message = EmailMessage()
+    message["From"] = GMAIL_ADDRESS
+    message["To"] = MOTION_EMAIL_TO
+    message["Subject"] = MOTION_EMAIL_SUBJECT
+    message.set_content(
+        "Motion was detected by the Raspberry Pi camera.\n\n"
+        f"Detected at: {detected_at.isoformat()}\n"
+        f"Camera host: {socket.gethostname()}\n\n"
+        "Another alert will be eligible only after the configured quiet period."
+    )
+
+    tls_context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com", 465, timeout=20, context=tls_context
+    ) as smtp:
+        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        smtp.send_message(message)
+
+
+async def deliver_motion_email(detected_at):
+    try:
+        await asyncio.to_thread(send_motion_email, detected_at)
+        print(f"Motion notification sent to {MOTION_EMAIL_TO}")
+    except Exception as error:
+        # This event remains consumed even if delivery fails, which prevents a
+        # broken SMTP configuration from creating a rapid retry/spam loop.
+        print(f"Unable to send motion notification: {error}")
+
+
+def schedule_motion_email(detected_at):
+    task = asyncio.create_task(deliver_motion_email(detected_at))
+    motion_email_tasks.add(task)
+    task.add_done_callback(motion_email_tasks.discard)
+
+
+def extract_luminance_frame(frame, stream_size):
+    """Extract the Y plane from Picamera2's YUV420 low-resolution array."""
+    width, height = stream_size
+    if frame.ndim == 2:
+        return frame[:height, :width]
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+
+async def motion_detection_loop():
+    global motion_period_active, motion_last_detected_at
+    global motion_consecutive_frames
+
+    while True:
+        await motion_armed_event.wait()
+        if not motion_armed:
+            continue
+
+        iteration_started_at = time.monotonic()
+        try:
+            async with camera_lock:
+                frame = camera.capture_array("lores")
+                current_stream_size = motion_stream_size
+        except Exception as error:
+            print(f"Unable to capture motion-detection frame: {error}")
+            await asyncio.sleep(MOTION_SAMPLE_INTERVAL_SECONDS)
+            continue
+
+        # Disarm may have been requested while this task was waiting for the
+        # camera lock. Do not process a frame after that state change.
+        if not motion_armed:
+            continue
+
+        try:
+            luminance_frame = extract_luminance_frame(frame, current_stream_size)
+            detected = motion_detector.detects_motion(luminance_frame)
+        except Exception as error:
+            motion_detector.reset()
+            print(f"Unable to process motion-detection frame: {error}")
+            await asyncio.sleep(MOTION_SAMPLE_INTERVAL_SECONDS)
+            continue
+        now = time.monotonic()
+
+        if detected:
+            if (
+                motion_period_active
+                and motion_last_detected_at is not None
+                and now - motion_last_detected_at >= MOTION_CLEAR_SECONDS
+            ):
+                motion_period_active = False
+                motion_consecutive_frames = 0
+            motion_last_detected_at = now
+            motion_consecutive_frames += 1
+            if (
+                not motion_period_active
+                and motion_consecutive_frames >= MOTION_REQUIRED_FRAMES
+            ):
+                motion_period_active = True
+                detected_at = datetime.now().astimezone()
+                print(f"Motion detected at {detected_at.isoformat()}")
+                schedule_motion_email(detected_at)
+        else:
+            motion_consecutive_frames = 0
+            if (
+                motion_period_active
+                and motion_last_detected_at is not None
+                and now - motion_last_detected_at >= MOTION_CLEAR_SECONDS
+            ):
+                motion_period_active = False
+                motion_last_detected_at = None
+                print("Motion period ended; notification is eligible again")
+
+        elapsed = time.monotonic() - iteration_started_at
+        await asyncio.sleep(max(0, MOTION_SAMPLE_INTERVAL_SECONDS - elapsed))
+
+
 async def send_frames(websocket):
     global JPEG_QUALITY
     while True:
-        frame = camera.capture_array()
+        async with camera_lock:
+            frame = camera.capture_array("main")
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
         _, buffer = cv2.imencode(".jpg", frame, encode_params)
         try:
@@ -332,7 +609,7 @@ async def send_frames(websocket):
 
 
 async def receive_commands(websocket, session):
-    global JPEG_QUALITY, WIDTH, HEIGHT
+    global JPEG_QUALITY, WIDTH, HEIGHT, motion_stream_size
     async for message in websocket:
         aes_key = None
         request_id = None
@@ -348,22 +625,24 @@ async def receive_commands(websocket, session):
                 if not 1 <= new_quality <= 100:
                     raise ValueError("JPEG quality must be between 1 and 100")
                 if (
-                    not 1 <= new_width <= 16_384
-                    or not 1 <= new_height <= 16_384
+                    not 2 <= new_width <= 16_384
+                    or not 2 <= new_height <= 16_384
                 ):
                     raise ValueError("Resolution dimensions are outside the allowed range")
 
-                JPEG_QUALITY = new_quality
                 if new_width != WIDTH or new_height != HEIGHT:
+                    new_configuration, new_motion_stream_size = (
+                        create_camera_configuration(new_width, new_height)
+                    )
+                    async with camera_lock:
+                        camera.stop()
+                        camera.configure(new_configuration)
+                        camera.start()
+                        motion_stream_size = new_motion_stream_size
                     WIDTH = new_width
                     HEIGHT = new_height
-                    camera.stop()
-                    camera.configure(
-                        camera.create_preview_configuration(
-                            main={"format": "RGB888", "size": (WIDTH, HEIGHT)}
-                        )
-                    )
-                    camera.start()
+                    motion_detector.reset()
+                JPEG_QUALITY = new_quality
                 response = {
                     "settings_updated": True,
                     "width": WIDTH,
@@ -383,6 +662,21 @@ async def receive_commands(websocket, session):
                 }
             elif command == "get_access_log":
                 response = {"access_log": access_log}
+            elif command == "arm_motion_detection":
+                if not MOTION_EMAIL_CONFIGURED:
+                    response = {
+                        **motion_status_payload(),
+                        "motion_error": (
+                            "Gmail is not configured on the server; motion "
+                            "detection was not armed"
+                        ),
+                    }
+                else:
+                    arm_motion_detection()
+                    response = motion_status_payload()
+            elif command == "disarm_motion_detection":
+                disarm_motion_detection()
+                response = motion_status_payload()
             else:
                 raise ValueError("Unknown command")
 
@@ -447,7 +741,10 @@ async def authenticate(websocket, session):
 
         log_access_attempt(websocket, True)
         await send_encrypted_response(
-            websocket, aes_key, request_id, {"authenticated": True}
+            websocket,
+            aes_key,
+            request_id,
+            {"authenticated": True, **motion_status_payload()},
         )
         return True
     except asyncio.TimeoutError:
@@ -520,8 +817,14 @@ async def handle_connection(websocket):
 
 async def main():
     """Start the WebSocket server."""
-    async with websockets.serve(handle_connection, "localhost", 8000):
-        await asyncio.Future()
+    detector_task = asyncio.create_task(motion_detection_loop())
+    try:
+        async with websockets.serve(handle_connection, "localhost", 8000):
+            await asyncio.Future()
+    finally:
+        detector_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await detector_task
 
 
 if __name__ == "__main__":
