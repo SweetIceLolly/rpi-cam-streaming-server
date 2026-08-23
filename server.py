@@ -83,6 +83,7 @@ MOTION_WARMUP_FRAMES = load_bounded_number(
 MOTION_REQUIRED_FRAMES = load_bounded_number(
     "MOTION_REQUIRED_FRAMES", 2, 1, 100, int
 )
+MOTION_CAPTURE_DELAY_SECONDS = 5
 
 # Command protocol settings
 COMMAND_AAD = b"rpi-camera-command-v1"
@@ -517,12 +518,6 @@ async def deliver_motion_email(detected_at, capture):
         print(f"Unable to send motion notification: {error}")
 
 
-def schedule_motion_email(detected_at, capture):
-    task = asyncio.create_task(deliver_motion_email(detected_at, capture))
-    motion_email_tasks.add(task)
-    task.add_done_callback(motion_email_tasks.discard)
-
-
 async def capture_motion_jpeg():
     """Capture and encode the current full-resolution main camera frame."""
     async with camera_lock:
@@ -532,6 +527,25 @@ async def capture_motion_jpeg():
     if not encoded:
         raise RuntimeError("OpenCV could not encode the motion capture")
     return bytes(buffer)
+
+
+async def capture_and_deliver_motion_email(detected_at):
+    """Capture five seconds after detection, then deliver the motion alert."""
+    await asyncio.sleep(MOTION_CAPTURE_DELAY_SECONDS)
+    try:
+        capture = await capture_motion_jpeg()
+    except Exception as error:
+        # Do not send an incomplete alert: the next motion period can try again
+        # after the configured quiet interval.
+        print(f"Unable to capture motion notification image: {error}")
+        return
+    await deliver_motion_email(detected_at, capture)
+
+
+def schedule_motion_email(detected_at):
+    task = asyncio.create_task(capture_and_deliver_motion_email(detected_at))
+    motion_email_tasks.add(task)
+    task.add_done_callback(motion_email_tasks.discard)
 
 
 def extract_luminance_frame(frame, stream_size):
@@ -593,14 +607,7 @@ async def motion_detection_loop():
                 motion_period_active = True
                 detected_at = datetime.now().astimezone()
                 print(f"Motion detected at {detected_at.isoformat()}")
-                try:
-                    capture = await capture_motion_jpeg()
-                except Exception as error:
-                    # Do not send an incomplete alert: the next motion period can
-                    # try again after the configured quiet interval.
-                    print(f"Unable to capture motion notification image: {error}")
-                else:
-                    schedule_motion_email(detected_at, capture)
+                schedule_motion_email(detected_at)
         else:
             motion_consecutive_frames = 0
             if (

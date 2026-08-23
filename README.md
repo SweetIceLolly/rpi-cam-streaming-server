@@ -41,7 +41,8 @@ pinned key.
 Motion detection is disarmed at startup. After an authenticated browser presses
 **Arm Motion Detection**, the server samples a low-resolution luminance stream
 and sends one email for the resulting motion period. The email includes a JPEG
-capture from the full-resolution camera stream taken when motion is confirmed.
+capture from the full-resolution camera stream taken five seconds after motion
+is confirmed.
 It becomes eligible to send another email only after a full quiet interval has
 elapsed. Pressing **Disarm Motion Detection** stops motion-frame capture and
 processing and resets the current period.
